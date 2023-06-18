@@ -42,12 +42,14 @@ use arrow::{
     },
     util::bit_util,
 };
+use futures::stream::select_all;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 use hashbrown::raw::RawTable;
 use smallvec::smallvec;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::{any::Any, usize, vec};
 
 use datafusion_common::cast::{as_dictionary_array, as_string_array};
@@ -87,6 +89,8 @@ use crate::physical_plan::joins::hash_join_utils::JoinHashMap;
 
 type JoinLeftData = (JoinHashMap, RecordBatch, MemoryReservation);
 
+const RANDOM_STATE: RandomState = RandomState::with_seeds(0, 0, 0, 0);
+
 /// Join execution plan executes partitions in parallel and combines them into a set of
 /// partitions.
 ///
@@ -109,8 +113,6 @@ pub struct HashJoinExec {
     schema: SchemaRef,
     /// Build-side data
     left_fut: OnceAsync<JoinLeftData>,
-    /// Shares the `RandomState` for the hashing algorithm
-    random_state: RandomState,
     /// Partitioning mode to use
     pub(crate) mode: PartitionMode,
     /// Execution metrics
@@ -147,8 +149,6 @@ impl HashJoinExec {
         let (schema, column_indices) =
             build_join_schema(&left_schema, &right_schema, join_type);
 
-        let random_state = RandomState::with_seeds(0, 0, 0, 0);
-
         Ok(HashJoinExec {
             left,
             right,
@@ -157,7 +157,6 @@ impl HashJoinExec {
             join_type: *join_type,
             schema: Arc::new(schema),
             left_fut: Default::default(),
-            random_state,
             mode: partition_mode,
             metrics: ExecutionPlanMetricsSet::new(),
             column_indices,
@@ -359,11 +358,19 @@ impl ExecutionPlan for HashJoinExec {
             PartitionMode::CollectLeft => self.left_fut.once(|| {
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
+
+                // Create hash streams of all left child partitions.
+                let hash_streams = (0..self.left.output_partitioning().partition_count())
+                    .map(|partition| self.left.execute(partition, context.clone()))
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .map(|stream| HashBuildStream::new(stream, on_left.clone()))
+                    .collect();
+
                 collect_left_input(
-                    None,
-                    self.random_state.clone(),
-                    self.left.clone(),
-                    on_left.clone(),
+                    self.left.schema(),
+                    hash_streams,
                     context.clone(),
                     join_metrics.clone(),
                     reservation,
@@ -374,11 +381,14 @@ impl ExecutionPlan for HashJoinExec {
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
                         .register(context.memory_pool());
 
-                OnceFut::new(collect_left_input(
-                    Some(partition),
-                    self.random_state.clone(),
-                    self.left.clone(),
+                let hash_stream = HashBuildStream::new(
+                    self.left.execute(partition, context.clone())?,
                     on_left.clone(),
+                );
+
+                OnceFut::new(collect_left_input(
+                    self.left.schema(),
+                    vec![hash_stream],
                     context.clone(),
                     join_metrics.clone(),
                     reservation,
@@ -409,7 +419,6 @@ impl ExecutionPlan for HashJoinExec {
             visited_left_side: None,
             right: right_stream,
             column_indices: self.column_indices.clone(),
-            random_state: self.random_state.clone(),
             join_metrics,
             null_equals_null: self.null_equals_null,
             is_exhausted: false,
@@ -450,51 +459,89 @@ impl ExecutionPlan for HashJoinExec {
     }
 }
 
-async fn collect_left_input(
-    partition: Option<usize>,
-    random_state: RandomState,
-    left: Arc<dyn ExecutionPlan>,
+/// Holds a batch with corresponding row hashes.
+struct BatchWithHashes {
+    batch: RecordBatch,
+    /// Hashes for each row.
+    hashes: Vec<u64>,
+}
+
+/// Stream for computing hashes on incoming batches from the left child.
+struct HashBuildStream {
+    /// The stream we'll be computing hashes on.
+    stream: SendableRecordBatchStream,
+    /// Column expressions that will get the columns to hash.
     on_left: Vec<Column>,
+}
+
+impl HashBuildStream {
+    fn new(stream: SendableRecordBatchStream, on_left: Vec<Column>) -> HashBuildStream {
+        HashBuildStream { stream, on_left }
+    }
+
+    /// Compute the hashes for a record batch.
+    fn compute_hash(&self, batch: RecordBatch) -> Result<BatchWithHashes> {
+        let cols = self
+            .on_left
+            .iter()
+            .map(|c| Ok(c.evaluate(&batch)?.into_array(batch.num_rows())))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut hash_buf = vec![0; batch.num_rows()];
+        let _ = create_hashes(&cols, &RANDOM_STATE, &mut hash_buf)?;
+
+        Ok(BatchWithHashes {
+            batch,
+            hashes: hash_buf,
+        })
+    }
+}
+
+impl Stream for HashBuildStream {
+    type Item = Result<BatchWithHashes>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let batch = match ready!(self.stream.poll_next_unpin(cx)) {
+            Some(Ok(batch)) => batch,
+            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+            None => return Poll::Ready(None),
+        };
+
+        let result = self.compute_hash(batch);
+        Poll::Ready(Some(result))
+    }
+}
+
+async fn collect_left_input(
+    left_schema: SchemaRef,
+    streams: Vec<HashBuildStream>,
     context: Arc<TaskContext>,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
 ) -> Result<JoinLeftData> {
-    let schema = left.schema();
-
-    let (left_input, left_input_partition) = if let Some(partition) = partition {
-        (left, partition)
-    } else {
-        let merge = {
-            if left.output_partitioning().partition_count() != 1 {
-                Arc::new(CoalescePartitionsExec::new(left))
-            } else {
-                left
-            }
-        };
-
-        (merge, 0)
-    };
-
-    // Depending on partition argument load single partition or whole left side in memory
-    let stream = left_input.execute(left_input_partition, context.clone())?;
+    // Combine all hash streams into a single stream.
+    let stream = select_all(streams);
 
     // This operation performs 2 steps at once:
     // 1. creates a [JoinHashMap] of all batches from the stream
     // 2. stores the batches in a vector.
     let initial = (Vec::new(), 0, metrics, reservation);
-    let (batches, num_rows, metrics, mut reservation) = stream
-        .try_fold(initial, |mut acc, batch| async {
-            let batch_size = batch.get_array_memory_size();
+    let (hashed_batches, num_rows, metrics, mut reservation) = stream
+        .try_fold(initial, |mut acc, hashed| async {
+            let batch_size = hashed.batch.get_array_memory_size();
             // Reserve memory for incoming batch
             acc.3.try_grow(batch_size)?;
             // Update metrics
             acc.2.build_mem_used.add(batch_size);
             acc.2.build_input_batches.add(1);
-            acc.2.build_input_rows.add(batch.num_rows());
+            acc.2.build_input_rows.add(hashed.batch.num_rows());
             // Update rowcount
-            acc.1 += batch.num_rows();
-            // Push batch to output
-            acc.0.push(batch);
+            acc.1 += hashed.batch.num_rows();
+            // Push hased batch to output
+            acc.0.push(hashed);
             Ok(acc)
         })
         .await?;
@@ -519,24 +566,32 @@ async fn collect_left_input(
     metrics.build_mem_used.add(estimated_hastable_size);
 
     let mut hashmap = JoinHashMap(RawTable::with_capacity(num_rows));
-    let mut hashes_buffer = Vec::new();
     let mut offset = 0;
-    for batch in batches.iter() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
-        update_hash(
-            &on_left,
-            batch,
-            &mut hashmap,
-            offset,
-            &random_state,
-            &mut hashes_buffer,
-        )?;
-        offset += batch.num_rows();
+    for hashed_batch in hashed_batches.iter() {
+        // insert hashes to key of the hashmap
+        for (row, hash_value) in hashed_batch.hashes.iter().enumerate() {
+            let item = hashmap
+                .0
+                .get_mut(*hash_value, |(hash, _)| *hash_value == *hash);
+            if let Some((_, indices)) = item {
+                indices.push((row + offset) as u64);
+            } else {
+                hashmap.0.insert(
+                    *hash_value,
+                    (*hash_value, smallvec![(row + offset) as u64]),
+                    |(hash, _)| *hash,
+                );
+            }
+        }
+
+        offset += hashed_batch.batch.num_rows();
     }
+
+    let batches: Vec<_> = hashed_batches.into_iter().map(|b| b.batch).collect();
+
     // Merge all batches into a single batch, so we
     // can directly index into the arrays
-    let single_batch = concat_batches(&schema, &batches, num_rows)?;
+    let single_batch = concat_batches(&left_schema, &batches, num_rows)?;
 
     Ok((hashmap, single_batch, reservation))
 }
@@ -596,8 +651,6 @@ struct HashJoinStream {
     visited_left_side: Option<BooleanBufferBuilder>,
     /// right
     right: SendableRecordBatchStream,
-    /// Random state used for hashing initialization
-    random_state: RandomState,
     /// There is nothing to process anymore and left side is processed in case of left join
     is_exhausted: bool,
     /// Metrics
@@ -1154,7 +1207,7 @@ impl HashJoinStream {
                         &self.on_left,
                         &self.on_right,
                         self.filter.as_ref(),
-                        &self.random_state,
+                        &RANDOM_STATE,
                         self.null_equals_null,
                         &mut hashes_buffer,
                         None,
