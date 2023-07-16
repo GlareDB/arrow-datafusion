@@ -21,24 +21,23 @@
 //! # Design
 //!
 //! ```text
-//! +----+      +------+
-//! | TX |==||  | Gate |
-//! +----+  ||  |      |  +------------------+  +----+
-//!         ====|      |==| Channel (buffer) |==| RX |
-//! +----+  ||  |      |  +------------------+  +----+
-//! | TX |==||  |      |
-//! +----+      |      |
-//!             |      |
-//! +----+      |      |  +------------------+  +----+
-//! | TX |======|      |==| Channel (buffer) |==| RX |
-//! +----+      +------+  +------------------+  +----+
+//! +----+
+//! | TX |==||
+//! +----+  ||    +------------------+  +----+
+//!         ======| Channel (buffer) |==| RX |
+//! +----+  ||    +------------------+  +----+
+//! | TX |==||
+//! +----+
+//!
+//! +----+        +------------------+  +----+
+//! | TX |========| Channel (buffer) |==| RX |
+//! +----+        +------------------+  +----+
 //! ```
 //!
-//! There are `N` virtual MPSC (multi-producer, single consumer) channels with
-//! unbounded capacity. However, if all buffers/channels are non-empty, then a
-//! global gate will be closed preventing new data from being written. Sender
-//! futures will be [pending](Poll::Pending) until at least one channel is empty
-//! (and not closed).
+//! There are `N` virtual MPSC (multi-producer, single consumer) channels each
+//! which their own bounded buffers. If a channel reaches its upper limit, data
+//! will need to be pulled on the consuming side before additional data is sent.
+
 use std::{
     collections::VecDeque,
     future::Future,
@@ -49,6 +48,7 @@ use std::{
 
 use parking_lot::Mutex;
 
+/// Size of the buffer per channel.
 const PER_CHANNEL_BUFFER: usize = 16;
 
 /// Create `n` empty channels.
@@ -180,6 +180,8 @@ impl<'a, T: Unpin> Future for SendFuture<'a, T> {
         }
 
         if guard_channel.data.len() >= PER_CHANNEL_BUFFER {
+            // We've reached the buffer limit. Store the waker until we have
+            // more room in the buffer.
             guard_channel.send_wakers.push(cx.waker().clone());
             Poll::Pending
         } else {
@@ -236,6 +238,8 @@ impl<'a, T> Future for RecvFuture<'a, T> {
 
         match guard_channel.data.pop_front() {
             Some(element) => {
+                // Only wake a single sender since we've only make room for one
+                // piece of data.
                 guard_channel.wake_a_sender();
                 self.rdy = true;
                 Poll::Ready(Some(element))
@@ -271,22 +275,27 @@ struct Channel<T> {
     recv_waker: Option<Waker>,
 
     /// Wakers for sender side.
+    ///
+    /// Send wakers will be stored when the channel buffer is full.
     send_wakers: Vec<Waker>,
 }
 
 impl<T> Channel<T> {
+    /// Wake the receiver.
     fn wake_receiver(&mut self) {
         if let Some(waker) = self.recv_waker.take() {
             waker.wake();
         }
     }
 
+    /// Wake all senders.
     fn wake_senders(&mut self) {
         for waker in self.send_wakers.drain(..) {
             waker.wake();
         }
     }
 
+    /// Wake a single sender. Which sender to wake is picked arbitrarily.
     fn wake_a_sender(&mut self) {
         if let Some(waker) = self.send_wakers.pop() {
             waker.wake();
