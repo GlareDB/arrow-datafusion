@@ -23,20 +23,22 @@
 //! ```text
 //! +----+      +------+
 //! | TX |==||  | Gate |
-//! +----+  ||  |      |  +--------+  +----+
-//!         ====|      |==| Buffer |==| RX |
-//! +----+  ||  |      |  +--------+  +----+
+//! +----+  ||  |      |  +------------------+  +----+
+//!         ====|      |==| Channel (buffer) |==| RX |
+//! +----+  ||  |      |  +------------------+  +----+
 //! | TX |==||  |      |
 //! +----+      |      |
 //!             |      |
-//! +----+      |      |  +--------+  +----+
-//! | TX |======|      |==| Buffer |==| RX |
-//! +----+      +------+  +--------+  +----+
+//! +----+      |      |  +------------------+  +----+
+//! | TX |======|      |==| Channel (buffer) |==| RX |
+//! +----+      +------+  +------------------+  +----+
 //! ```
 //!
-//! There are `N` virtual MPSC (multi-producer, single consumer) channels with unbounded capacity. However, if all
-//! buffers/channels are non-empty, than a global gate will be closed preventing new data from being written (the
-//! sender futures will be [pending](Poll::Pending)) until at least one channel is empty (and not closed).
+//! There are `N` virtual MPSC (multi-producer, single consumer) channels with
+//! unbounded capacity. However, if all buffers/channels are non-empty, then a
+//! global gate will be closed preventing new data from being written. Sender
+//! futures will be [pending](Poll::Pending) until at least one channel is empty
+//! (and not closed).
 use std::{
     collections::VecDeque,
     future::Future,
@@ -47,38 +49,32 @@ use std::{
 
 use parking_lot::Mutex;
 
+const PER_CHANNEL_BUFFER: usize = 16;
+
 /// Create `n` empty channels.
 pub fn channels<T>(
     n: usize,
 ) -> (Vec<DistributionSender<T>>, Vec<DistributionReceiver<T>>) {
     let channels = (0..n)
-        .map(|id| {
+        .map(|_| {
             Arc::new(Mutex::new(Channel {
-                data: VecDeque::default(),
+                data: VecDeque::with_capacity(PER_CHANNEL_BUFFER),
                 n_senders: 1,
                 recv_alive: true,
-                recv_wakers: Vec::default(),
-                id,
+                recv_waker: None,
+                send_wakers: Vec::new(),
             }))
         })
         .collect::<Vec<_>>();
-    let gate = Arc::new(Mutex::new(Gate {
-        empty_channels: n,
-        send_wakers: Vec::default(),
-    }));
     let senders = channels
         .iter()
         .map(|channel| DistributionSender {
             channel: Arc::clone(channel),
-            gate: Arc::clone(&gate),
         })
         .collect();
     let receivers = channels
         .into_iter()
-        .map(|channel| DistributionReceiver {
-            channel,
-            gate: Arc::clone(&gate),
-        })
+        .map(|channel| DistributionReceiver { channel })
         .collect();
     (senders, receivers)
 }
@@ -123,9 +119,7 @@ impl<T> std::error::Error for SendError<T> {}
 /// receive `None` afterwards.
 #[derive(Debug)]
 pub struct DistributionSender<T> {
-    /// To prevent lock inversion / deadlock, channel lock is always acquired prior to gate lock
     channel: SharedChannel<T>,
-    gate: SharedGate,
 }
 
 impl<T> DistributionSender<T> {
@@ -135,8 +129,7 @@ impl<T> DistributionSender<T> {
     pub fn send(&self, element: T) -> SendFuture<'_, T> {
         SendFuture {
             channel: &self.channel,
-            gate: &self.gate,
-            element: Box::new(Some(element)),
+            element: Some(element),
         }
     }
 }
@@ -148,7 +141,6 @@ impl<T> Clone for DistributionSender<T> {
 
         Self {
             channel: Arc::clone(&self.channel),
-            gate: Arc::clone(&self.gate),
         }
     }
 }
@@ -159,15 +151,8 @@ impl<T> Drop for DistributionSender<T> {
         guard_channel.n_senders -= 1;
 
         if guard_channel.n_senders == 0 {
-            // Note: the recv_alive check is so that we don't double-clear the status
-            if guard_channel.data.is_empty() && guard_channel.recv_alive {
-                // channel is gone, so we need to clear our signal
-                let mut guard_gate = self.gate.lock();
-                guard_gate.empty_channels -= 1;
-            }
-
             // receiver may be waiting for data, but should return `None` now since the channel is closed
-            guard_channel.wake_receivers();
+            guard_channel.wake_receiver();
         }
     }
 }
@@ -176,48 +161,34 @@ impl<T> Drop for DistributionSender<T> {
 #[derive(Debug)]
 pub struct SendFuture<'a, T> {
     channel: &'a SharedChannel<T>,
-    gate: &'a SharedGate,
-    // the additional Box is required for `Self: Unpin`
-    element: Box<Option<T>>,
+    element: Option<T>,
 }
 
-impl<'a, T> Future for SendFuture<'a, T> {
+impl<'a, T: Unpin> Future for SendFuture<'a, T> {
     type Output = Result<(), SendError<T>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        assert!(this.element.is_some(), "polled ready future");
+        assert!(self.element.is_some(), "polled ready future");
 
-        let mut guard_channel = this.channel.lock();
+        let mut guard_channel = self.channel.lock();
 
         // receiver end still alive?
         if !guard_channel.recv_alive {
             return Poll::Ready(Err(SendError(
-                this.element.take().expect("just checked"),
+                self.element.take().expect("just checked"),
             )));
         }
 
-        let mut guard_gate = this.gate.lock();
-
-        // does ANY receiver need data?
-        // if so, allow sender to create another
-        if guard_gate.empty_channels == 0 {
-            guard_gate
-                .send_wakers
-                .push((cx.waker().clone(), guard_channel.id));
-            return Poll::Pending;
+        if guard_channel.data.len() >= PER_CHANNEL_BUFFER {
+            guard_channel.send_wakers.push(cx.waker().clone());
+            Poll::Pending
+        } else {
+            guard_channel
+                .data
+                .push_back(self.element.take().expect("just checked"));
+            guard_channel.wake_receiver();
+            Poll::Ready(Ok(()))
         }
-
-        let was_empty = guard_channel.data.is_empty();
-        guard_channel
-            .data
-            .push_back(this.element.take().expect("just checked"));
-        if was_empty {
-            guard_gate.empty_channels -= 1;
-            guard_channel.wake_receivers();
-        }
-
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -225,7 +196,6 @@ impl<'a, T> Future for SendFuture<'a, T> {
 #[derive(Debug)]
 pub struct DistributionReceiver<T> {
     channel: SharedChannel<T>,
-    gate: SharedGate,
 }
 
 impl<T> DistributionReceiver<T> {
@@ -234,8 +204,7 @@ impl<T> DistributionReceiver<T> {
     /// Returns `None` if the channel is empty and no [senders](DistributionSender) are left.
     pub fn recv(&mut self) -> RecvFuture<'_, T> {
         RecvFuture {
-            channel: &mut self.channel,
-            gate: &mut self.gate,
+            channel: &self.channel,
             rdy: false,
         }
     }
@@ -244,27 +213,16 @@ impl<T> DistributionReceiver<T> {
 impl<T> Drop for DistributionReceiver<T> {
     fn drop(&mut self) {
         let mut guard_channel = self.channel.lock();
-        let mut guard_gate = self.gate.lock();
         guard_channel.recv_alive = false;
 
-        // Note: n_senders check is here so we don't double-clear the signal
-        if guard_channel.data.is_empty() && (guard_channel.n_senders > 0) {
-            // channel is gone, so we need to clear our signal
-            guard_gate.empty_channels -= 1;
-        }
-
         // senders may be waiting for gate to open but should error now that the channel is closed
-        guard_gate.wake_channel_senders(guard_channel.id);
-
-        // clear potential remaining data from channel
-        guard_channel.data.clear();
+        guard_channel.wake_senders();
     }
 }
 
 /// Future backing [recv](DistributionReceiver::recv).
 pub struct RecvFuture<'a, T> {
-    channel: &'a mut SharedChannel<T>,
-    gate: &'a mut SharedGate,
+    channel: &'a SharedChannel<T>,
     rdy: bool,
 }
 
@@ -272,39 +230,22 @@ impl<'a, T> Future for RecvFuture<'a, T> {
     type Output = Option<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        assert!(!this.rdy, "polled ready future");
+        assert!(!self.rdy, "polled ready future");
 
-        let mut guard_channel = this.channel.lock();
+        let mut guard_channel = self.channel.lock();
 
         match guard_channel.data.pop_front() {
             Some(element) => {
-                // change "empty" signal for this channel?
-                if guard_channel.data.is_empty() && (guard_channel.n_senders > 0) {
-                    let mut guard_gate = this.gate.lock();
-
-                    // update counter
-                    let old_counter = guard_gate.empty_channels;
-                    guard_gate.empty_channels += 1;
-
-                    // open gate?
-                    if old_counter == 0 {
-                        guard_gate.wake_all_senders();
-                    }
-
-                    drop(guard_gate);
-                    drop(guard_channel);
-                }
-
-                this.rdy = true;
+                guard_channel.wake_a_sender();
+                self.rdy = true;
                 Poll::Ready(Some(element))
             }
             None if guard_channel.n_senders == 0 => {
-                this.rdy = true;
+                self.rdy = true;
                 Poll::Ready(None)
             }
             None => {
-                guard_channel.recv_wakers.push(cx.waker().clone());
+                guard_channel.recv_waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         }
@@ -323,21 +264,31 @@ struct Channel<T> {
     /// Reference "counter"/flag for the single receiver.
     recv_alive: bool,
 
-    /// Wakers for the receiver side.
+    /// Waker for the receiver side.
     ///
     /// The receiver will be pending if the [buffer](Self::data) is empty and
     /// there are senders left (according to the [reference counter](Self::n_senders)).
-    recv_wakers: Vec<Waker>,
+    recv_waker: Option<Waker>,
 
-    /// Channel ID.
-    ///
-    /// This is used to address [send wakers](Gate::send_wakers).
-    id: usize,
+    /// Wakers for sender side.
+    send_wakers: Vec<Waker>,
 }
 
 impl<T> Channel<T> {
-    fn wake_receivers(&mut self) {
-        for waker in self.recv_wakers.drain(..) {
+    fn wake_receiver(&mut self) {
+        if let Some(waker) = self.recv_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn wake_senders(&mut self) {
+        for waker in self.send_wakers.drain(..) {
+            waker.wake();
+        }
+    }
+
+    fn wake_a_sender(&mut self) {
+        if let Some(waker) = self.send_wakers.pop() {
             waker.wake();
         }
     }
@@ -347,45 +298,6 @@ impl<T> Channel<T> {
 ///
 /// One or multiple senders and a single receiver will share a channel.
 type SharedChannel<T> = Arc<Mutex<Channel<T>>>;
-
-/// The "all channels have data" gate.
-#[derive(Debug)]
-struct Gate {
-    /// Number of currently empty (and still open) channels.
-    empty_channels: usize,
-
-    /// Wakers for the sender side, including their channel IDs.
-    send_wakers: Vec<(Waker, usize)>,
-}
-
-impl Gate {
-    //// Wake all senders.
-    ///
-    /// This is helpful to signal that there are some channels empty now and hence the gate was opened.
-    fn wake_all_senders(&mut self) {
-        for (waker, _id) in self.send_wakers.drain(..) {
-            waker.wake();
-        }
-    }
-
-    /// Wake senders for a specific channel.
-    ///
-    /// This is helpful to signal that the receiver side is gone and the senders shall now error.
-    fn wake_channel_senders(&mut self, id: usize) {
-        // `drain_filter` is unstable, so implement our own
-        let (wake, keep) = self
-            .send_wakers
-            .drain(..)
-            .partition(|(_waker, id2)| id == *id2);
-        self.send_wakers = keep;
-        for (waker, _id) in wake {
-            waker.wake();
-        }
-    }
-}
-
-/// Gate shared by all senders and receivers.
-type SharedGate = Arc<Mutex<Gate>>;
 
 #[cfg(test)]
 mod tests {
