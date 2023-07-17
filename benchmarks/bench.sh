@@ -161,7 +161,7 @@ main() {
             echo "COMMAND: ${COMMAND}"
             echo "BENCHMARK: ${BENCHMARK}"
             echo "DATAFUSION_DIR: ${DATAFUSION_DIR}"
-            echo "BRACH_NAME: ${BRANCH_NAME}"
+            echo "BRANCH_NAME: ${BRANCH_NAME}"
             echo "DATA_DIR: ${DATA_DIR}"
             echo "RESULTS_DIR: ${RESULTS_DIR}"
             echo "CARGO_COMMAND: ${CARGO_COMMAND}"
