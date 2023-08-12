@@ -19,6 +19,7 @@
 //! partitioning scheme (according to flag `preserve_order` ordering can be preserved during
 //! repartitioning if its input is ordered).
 
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -50,6 +51,7 @@ use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{OrderingEquivalenceProperties, PhysicalExpr};
 
+use flume::r#async::RecvStream;
 use futures::stream::Stream;
 use futures::{FutureExt, StreamExt};
 use hashbrown::HashMap;
@@ -60,8 +62,8 @@ use tokio::task::JoinHandle;
 mod distributor_channels;
 
 type MaybeBatch = Option<Result<RecordBatch>>;
-type InputPartitionsToCurrentPartitionSender = Vec<DistributionSender<MaybeBatch>>;
-type InputPartitionsToCurrentPartitionReceiver = Vec<DistributionReceiver<MaybeBatch>>;
+type InputPartitionsToCurrentPartitionSender = Vec<flume::Sender<MaybeBatch>>;
+type InputPartitionsToCurrentPartitionReceiver = Vec<flume::Receiver<MaybeBatch>>;
 
 /// Inner state of [`RepartitionExec`].
 #[derive(Debug)]
@@ -490,17 +492,21 @@ impl ExecutionPlan for RepartitionExec {
         // if this is the first partition to be invoked then we need to set up initial state
         if state.channels.is_empty() {
             let (txs, rxs) = if self.preserve_order {
-                let (txs, rxs) =
-                    partition_aware_channels(num_input_partitions, num_output_partitions);
-                // Take transpose of senders and receivers. `state.channels` keeps track of entries per output partition
-                let txs = transpose(txs);
-                let rxs = transpose(rxs);
-                (txs, rxs)
+                // let (txs, rxs) =
+                //     partition_aware_channels(num_input_partitions, num_output_partitions);
+                // // Take transpose of senders and receivers. `state.channels` keeps track of entries per output partition
+                // let txs = transpose(txs);
+                // let rxs = transpose(rxs);
+                // (txs, rxs)
+                unimplemented!()
             } else {
                 // create one channel per *output* partition
                 // note we use a custom channel that ensures there is always data for each receiver
                 // but limits the amount of buffering if required.
-                let (txs, rxs) = channels(num_output_partitions);
+                // let (txs, rxs) = channels(num_output_partitions);
+                let (txs, rxs): (Vec<_>, Vec<_>) = (0..num_output_partitions)
+                    .map(|_| flume::bounded(1))
+                    .unzip();
                 // Clone sender for each input partitions
                 let txs = txs
                     .into_iter()
@@ -605,7 +611,7 @@ impl ExecutionPlan for RepartitionExec {
                 num_input_partitions,
                 num_input_partitions_processed: 0,
                 schema: self.input.schema(),
-                input: rx.swap_remove(0),
+                input: rx.swap_remove(0).into_stream(),
                 drop_helper: Arc::clone(&state.abort_helper),
                 reservation,
             }))
@@ -654,7 +660,7 @@ impl RepartitionExec {
         partition: usize,
         mut output_channels: HashMap<
             usize,
-            (DistributionSender<MaybeBatch>, SharedMemoryReservation),
+            (flume::Sender<MaybeBatch>, SharedMemoryReservation),
         >,
         partitioning: Partitioning,
         metrics: RepartitionMetrics,
@@ -691,7 +697,7 @@ impl RepartitionExec {
                 if let Some((tx, reservation)) = output_channels.get_mut(&partition) {
                     reservation.lock().try_grow(size)?;
 
-                    if tx.send(Some(Ok(batch))).await.is_err() {
+                    if tx.send_async(Some(Ok(batch))).await.is_err() {
                         // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
                         reservation.lock().shrink(size);
                         output_channels.remove(&partition);
@@ -734,7 +740,7 @@ impl RepartitionExec {
     /// channels.
     async fn wait_for_task(
         input_task: AbortOnDropSingle<Result<()>>,
-        txs: HashMap<usize, DistributionSender<MaybeBatch>>,
+        txs: HashMap<usize, flume::Sender<MaybeBatch>>,
     ) {
         // wait for completion, and propagate error
         // note we ignore errors on send (.ok) as that means the receiver has already shutdown.
@@ -748,7 +754,7 @@ impl RepartitionExec {
                         "Join Error".to_string(),
                         Box::new(DataFusionError::External(Box::new(Arc::clone(&e)))),
                     ));
-                    tx.send(Some(err)).await.ok();
+                    tx.send_async(Some(err)).await.ok();
                 }
             }
             // Error from running input task
@@ -758,14 +764,14 @@ impl RepartitionExec {
                 for (_, tx) in txs {
                     // wrap it because need to send error to all output partitions
                     let err = Err(DataFusionError::External(Box::new(e.clone())));
-                    tx.send(Some(err)).await.ok();
+                    tx.send_async(Some(err)).await.ok();
                 }
             }
             // Input task completed successfully
             Ok(Ok(())) => {
                 // notify each output partition that this input partition has no more data
                 for (_, tx) in txs {
-                    tx.send(None).await.ok();
+                    tx.send_async(None).await.ok();
                 }
             }
         }
@@ -783,7 +789,7 @@ struct RepartitionStream {
     schema: SchemaRef,
 
     /// channel containing the repartitioned batches
-    input: DistributionReceiver<MaybeBatch>,
+    input: RecvStream<'static, MaybeBatch>,
 
     /// Handle to ensure background tasks are killed when no longer needed.
     #[allow(dead_code)]
@@ -801,7 +807,7 @@ impl Stream for RepartitionStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         loop {
-            match self.input.recv().poll_unpin(cx) {
+            match self.input.poll_next_unpin(cx) {
                 Poll::Ready(Some(Some(v))) => {
                     if let Ok(batch) = &v {
                         self.reservation
@@ -847,7 +853,7 @@ struct PerPartitionStream {
     schema: SchemaRef,
 
     /// channel containing the repartitioned batches
-    receiver: DistributionReceiver<MaybeBatch>,
+    receiver: flume::Receiver<MaybeBatch>,
 
     /// Handle to ensure background tasks are killed when no longer needed.
     #[allow(dead_code)]
@@ -864,8 +870,8 @@ impl Stream for PerPartitionStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        match self.receiver.recv().poll_unpin(cx) {
-            Poll::Ready(Some(Some(v))) => {
+        match self.receiver.recv_async().poll_unpin(cx) {
+            Poll::Ready(Ok(Some(v))) => {
                 if let Ok(batch) = &v {
                     self.reservation
                         .lock()
@@ -873,11 +879,11 @@ impl Stream for PerPartitionStream {
                 }
                 Poll::Ready(Some(v))
             }
-            Poll::Ready(Some(None)) => {
+            Poll::Ready(Ok(None)) => {
                 // Input partition has finished sending batches
                 Poll::Ready(None)
             }
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Err(_)) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }

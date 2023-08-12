@@ -255,7 +255,7 @@ impl ParquetExec {
     ) -> Self {
         let repartitioned_file_groups_option = FileScanConfig::repartition_file_groups(
             self.base_config.file_groups.clone(),
-            target_partitions,
+            target_partitions * 5,
             repartition_file_min_size,
         );
 
