@@ -28,7 +28,7 @@ use crate::{
     optimizer::optimizer::Optimizer,
     physical_optimizer::optimizer::{PhysicalOptimizer, PhysicalOptimizerRule},
 };
-use datafusion_common::alias::AliasGenerator;
+use datafusion_common::{alias::AliasGenerator, plan_err};
 use datafusion_execution::registry::SerializerRegistry;
 use datafusion_expr::{
     logical_plan::{DdlStatement, Statement},
@@ -470,19 +470,12 @@ impl SessionContext {
             input,
             if_not_exists,
             or_replace,
-            primary_key,
+            constraints,
         } = cmd;
-
-        if !primary_key.is_empty() {
-            Err(DataFusionError::Execution(
-                "Primary keys on MemoryTables are not currently supported!".to_string(),
-            ))?;
-        }
 
         let input = Arc::try_unwrap(input).unwrap_or_else(|e| e.as_ref().clone());
         let input = self.state().optimize(&input)?;
         let table = self.table(&name).await;
-
         match (if_not_exists, or_replace, table) {
             (true, false, Ok(_)) => self.return_empty_dataframe(),
             (false, true, Ok(_)) => {
@@ -500,11 +493,15 @@ impl SessionContext {
                 "'IF NOT EXISTS' cannot coexist with 'REPLACE'".to_string(),
             )),
             (_, _, Err(_)) => {
-                let schema = Arc::new(input.schema().as_ref().into());
+                let df_schema = input.schema();
+                let schema = Arc::new(df_schema.as_ref().into());
                 let physical = DataFrame::new(self.state(), input);
 
                 let batches: Vec<_> = physical.collect_partitioned().await?;
-                let table = Arc::new(MemTable::try_new(schema, batches)?);
+                let table = Arc::new(
+                    // pass constraints to the mem table.
+                    MemTable::try_new(schema, batches)?.with_constraints(constraints),
+                );
 
                 self.register_table(&name, table)?;
                 self.return_empty_dataframe()
@@ -958,10 +955,9 @@ impl SessionContext {
             (Some(s), _) => s,
             (None, false) => options.infer_schema(&self.state(), &table_path).await?,
             (None, true) => {
-                return Err(DataFusionError::Plan(
+                return plan_err!(
                     "Schema inference for infinite data sources is not supported."
-                        .to_string(),
-                ))
+                )
             }
         };
         let config = ListingTableConfig::new(table_path)
@@ -1028,8 +1024,14 @@ impl SessionContext {
     ) -> Result<()> {
         let listing_options = options.to_listing_options(&self.state.read().config);
 
-        self.register_listing_table(name, table_path, listing_options, None, None)
-            .await?;
+        self.register_listing_table(
+            name,
+            table_path,
+            listing_options,
+            options.schema.map(|s| Arc::new(s.to_owned())),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1182,7 +1184,7 @@ impl SessionContext {
         let schema = self.state.read().schema_for_ref(table_ref)?;
         match schema.table(&table).await {
             Some(ref provider) => Ok(Arc::clone(provider)),
-            _ => Err(DataFusionError::Plan(format!("No table named '{table}'"))),
+            _ => plan_err!("No table named '{table}'"),
         }
     }
 
@@ -2175,13 +2177,11 @@ mod tests {
     async fn create_variable_err() -> Result<()> {
         let ctx = SessionContext::new();
 
-        let err = plan_and_collect(&ctx, "SElECT @=   X#=?!~ 5")
-            .await
-            .unwrap_err();
+        let err = plan_and_collect(&ctx, "SElECT @=   X3").await.unwrap_err();
 
         assert_eq!(
             err.to_string(),
-            "Error during planning: variable [\"@\"] has no type information"
+            "Error during planning: variable [\"@=\"] has no type information"
         );
         Ok(())
     }
@@ -2250,7 +2250,7 @@ mod tests {
         // Note capitalization
         let my_avg = create_udaf(
             "MY_AVG",
-            DataType::Float64,
+            vec![DataType::Float64],
             Arc::new(DataType::Float64),
             Volatility::Immutable,
             Arc::new(|_| {
@@ -2309,11 +2309,11 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let expected = vec![
-            "+--------------+--------------+-----------------+",
-            "| SUM(test.c1) | SUM(test.c2) | COUNT(UInt8(1)) |",
-            "+--------------+--------------+-----------------+",
-            "| 10           | 110          | 20              |",
-            "+--------------+--------------+-----------------+",
+            "+--------------+--------------+----------+",
+            "| SUM(test.c1) | SUM(test.c2) | COUNT(*) |",
+            "+--------------+--------------+----------+",
+            "| 10           | 110          | 20       |",
+            "+--------------+--------------+----------+",
         ];
         assert_batches_eq!(expected, &results);
 

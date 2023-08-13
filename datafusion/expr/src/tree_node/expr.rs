@@ -72,7 +72,6 @@ impl TreeNode for Expr {
                 vec![left.as_ref().clone(), right.as_ref().clone()]
             }
             Expr::Like(Like { expr, pattern, .. })
-            | Expr::ILike(Like { expr, pattern, .. })
             | Expr::SimilarTo(Like { expr, pattern, .. }) => {
                 vec![expr.as_ref().clone(), pattern.as_ref().clone()]
             }
@@ -177,33 +176,26 @@ impl TreeNode for Expr {
                 expr,
                 pattern,
                 escape_char,
+                case_insensitive,
             }) => Expr::Like(Like::new(
                 negated,
                 transform_boxed(expr, &mut transform)?,
                 transform_boxed(pattern, &mut transform)?,
                 escape_char,
-            )),
-            Expr::ILike(Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-            }) => Expr::ILike(Like::new(
-                negated,
-                transform_boxed(expr, &mut transform)?,
-                transform_boxed(pattern, &mut transform)?,
-                escape_char,
+                case_insensitive,
             )),
             Expr::SimilarTo(Like {
                 negated,
                 expr,
                 pattern,
                 escape_char,
+                case_insensitive,
             }) => Expr::SimilarTo(Like::new(
                 negated,
                 transform_boxed(expr, &mut transform)?,
                 transform_boxed(pattern, &mut transform)?,
                 escape_char,
+                case_insensitive,
             )),
             Expr::Not(expr) => Expr::Not(transform_boxed(expr, &mut transform)?),
             Expr::IsNotNull(expr) => {
@@ -350,10 +342,10 @@ impl TreeNode for Expr {
             Expr::QualifiedWildcard { qualifier } => {
                 Expr::QualifiedWildcard { qualifier }
             }
-            Expr::GetIndexedField(GetIndexedField { key, expr }) => {
+            Expr::GetIndexedField(GetIndexedField { expr, field }) => {
                 Expr::GetIndexedField(GetIndexedField::new(
                     transform_boxed(expr, &mut transform)?,
-                    key,
+                    field,
                 ))
             }
             Expr::Placeholder(Placeholder { id, data_type }) => {

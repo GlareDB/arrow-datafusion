@@ -348,11 +348,17 @@ impl AsLogicalPlan for LogicalPlanNode {
                         FileFormatType::Csv(protobuf::CsvFormat {
                             has_header,
                             delimiter,
-                        }) => Arc::new(
-                            CsvFormat::default()
-                                .with_has_header(*has_header)
-                                .with_delimiter(str_to_byte(delimiter)?),
-                        ),
+                            quote,
+                            optional_escape
+                        }) => {
+                            let mut csv = CsvFormat::default()
+                            .with_has_header(*has_header)
+                            .with_delimiter(str_to_byte(delimiter, "delimiter")?)
+                            .with_quote(str_to_byte(quote, "quote")?);
+                            if let Some(protobuf::csv_format::OptionalEscape::Escape(escape)) = optional_escape {
+                                csv = csv.with_quote(str_to_byte(escape, "escape")?);
+                            }
+                            Arc::new(csv)},
                         FileFormatType::Avro(..) => Arc::new(AvroFormat),
                     };
 
@@ -844,8 +850,16 @@ impl AsLogicalPlan for LogicalPlanNode {
                         FileFormatType::Parquet(protobuf::ParquetFormat {})
                     } else if let Some(csv) = any.downcast_ref::<CsvFormat>() {
                         FileFormatType::Csv(protobuf::CsvFormat {
-                            delimiter: byte_to_string(csv.delimiter())?,
+                            delimiter: byte_to_string(csv.delimiter(), "delimiter")?,
                             has_header: csv.has_header(),
+                            quote: byte_to_string(csv.quote(), "quote")?,
+                            optional_escape: if let Some(escape) = csv.escape() {
+                                Some(protobuf::csv_format::OptionalEscape::Escape(
+                                    byte_to_string(escape, "escape")?,
+                                ))
+                            } else {
+                                None
+                            },
                         })
                     } else if any.is::<AvroFormat>() {
                         FileFormatType::Avro(protobuf::AvroFormat {})
@@ -1448,7 +1462,9 @@ mod roundtrip_tests {
         create_udf, CsvReadOptions, SessionConfig, SessionContext,
     };
     use datafusion::test_util::{TestTableFactory, TestTableProvider};
-    use datafusion_common::{DFSchemaRef, DataFusionError, Result, ScalarValue};
+    use datafusion_common::{
+        plan_err, DFSchemaRef, DataFusionError, Result, ScalarValue,
+    };
     use datafusion_expr::expr::{
         self, Between, BinaryExpr, Case, Cast, GroupingSet, InList, Like, ScalarFunction,
         ScalarUDF, Sort,
@@ -2420,6 +2436,8 @@ mod roundtrip_tests {
             let ctx = SessionContext::new();
             roundtrip_expr_test(test_expr, ctx);
         }
+        test(Operator::ArrowAt);
+        test(Operator::AtArrow);
         test(Operator::StringConcat);
         test(Operator::RegexNotIMatch);
         test(Operator::RegexNotMatch);
@@ -2548,6 +2566,7 @@ mod roundtrip_tests {
                 Box::new(col("col")),
                 Box::new(lit("[0-9]+")),
                 escape_char,
+                false,
             ));
             let ctx = SessionContext::new();
             roundtrip_expr_test(test_expr, ctx);
@@ -2561,11 +2580,12 @@ mod roundtrip_tests {
     #[test]
     fn roundtrip_ilike() {
         fn ilike(negated: bool, escape_char: Option<char>) {
-            let test_expr = Expr::ILike(Like::new(
+            let test_expr = Expr::Like(Like::new(
                 negated,
                 Box::new(col("col")),
                 Box::new(lit("[0-9]+")),
                 escape_char,
+                true,
             ));
             let ctx = SessionContext::new();
             roundtrip_expr_test(test_expr, ctx);
@@ -2584,6 +2604,7 @@ mod roundtrip_tests {
                 Box::new(col("col")),
                 Box::new(lit("[0-9]+")),
                 escape_char,
+                false,
             ));
             let ctx = SessionContext::new();
             roundtrip_expr_test(test_expr, ctx);
@@ -2671,7 +2692,7 @@ mod roundtrip_tests {
             // the name; used to represent it in plan descriptions and in the registry, to use in SQL.
             "dummy_agg",
             // the input type; DataFusion guarantees that the first entry of `values` in `update` has this type.
-            DataType::Float64,
+            vec![DataType::Float64],
             // the return type; DataFusion expects this to match the type returned by `evaluate`.
             Arc::new(DataType::Float64),
             Volatility::Immutable,
@@ -2857,7 +2878,7 @@ mod roundtrip_tests {
             // the name; used to represent it in plan descriptions and in the registry, to use in SQL.
             "dummy_agg",
             // the input type; DataFusion guarantees that the first entry of `values` in `update` has this type.
-            DataType::Float64,
+            vec![DataType::Float64],
             // the return type; DataFusion expects this to match the type returned by `evaluate`.
             Arc::new(DataType::Float64),
             Volatility::Immutable,
@@ -2896,11 +2917,11 @@ mod roundtrip_tests {
 
         fn return_type(arg_types: &[DataType]) -> Result<Arc<DataType>> {
             if arg_types.len() != 1 {
-                return Err(DataFusionError::Plan(format!(
+                return plan_err!(
                     "dummy_udwf expects 1 argument, got {}: {:?}",
                     arg_types.len(),
                     arg_types
-                )));
+                );
             }
             Ok(Arc::new(arg_types[0].clone()))
         }

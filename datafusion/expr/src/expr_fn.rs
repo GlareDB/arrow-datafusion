@@ -136,6 +136,17 @@ pub fn sum(expr: Expr) -> Expr {
     ))
 }
 
+/// Create an expression to represent the array_agg() aggregate function
+pub fn array_agg(expr: Expr) -> Expr {
+    Expr::AggregateFunction(AggregateFunction::new(
+        aggregate_function::AggregateFunction::ArrayAgg,
+        vec![expr],
+        false,
+        None,
+        None,
+    ))
+}
+
 /// Create an expression to represent the avg() aggregate function
 pub fn avg(expr: Expr) -> Expr {
     Expr::AggregateFunction(AggregateFunction::new(
@@ -502,7 +513,11 @@ scalar_expr!(
 scalar_expr!(Degrees, degrees, num, "converts radians to degrees");
 scalar_expr!(Radians, radians, num, "converts degrees to radians");
 nary_scalar_expr!(Round, round, "round to nearest integer");
-scalar_expr!(Trunc, trunc, num, "truncate toward zero");
+nary_scalar_expr!(
+    Trunc,
+    trunc,
+    "truncate toward zero, with optional precision"
+);
 scalar_expr!(Abs, abs, num, "absolute value");
 scalar_expr!(Signum, signum, num, "sign of the argument (-1, 0, +1) ");
 scalar_expr!(Exp, exp, num, "exponential");
@@ -520,7 +535,7 @@ scalar_expr!(
     num,
     "returns the hexdecimal representation of an integer"
 );
-scalar_expr!(Uuid, uuid, , "Returns uuid v4 as a string value");
+scalar_expr!(Uuid, uuid, , "returns uuid v4 as a string value");
 scalar_expr!(Log, log, base x, "logarithm of a `x` for a particular `base`");
 
 // array functions
@@ -532,11 +547,28 @@ scalar_expr!(
 );
 nary_scalar_expr!(ArrayConcat, array_concat, "concatenates arrays.");
 scalar_expr!(
-    ArrayContains,
-    array_contains,
+    ArrayHas,
+    array_has,
     first_array second_array,
-"returns true, if each element of the second array appe
-    aring in the first array, otherwise false."
+"Returns true, if the element appears in the first array, otherwise false."
+);
+scalar_expr!(
+    ArrayHasAll,
+    array_has_all,
+    first_array second_array,
+"Returns true if each element of the second array appears in the first array; otherwise, it returns false."
+);
+scalar_expr!(
+    ArrayHasAny,
+    array_has_any,
+    first_array second_array,
+"Returns true if at least one element of the second array appears in the first array; otherwise, it returns false."
+);
+scalar_expr!(
+    Flatten,
+    flatten,
+    array,
+    "flattens an array of arrays into a single array."
 );
 scalar_expr!(
     ArrayDims,
@@ -545,10 +577,10 @@ scalar_expr!(
     "returns an array of the array's dimensions."
 );
 scalar_expr!(
-    ArrayFill,
-    array_fill,
-    element array,
-    "returns an array filled with copies of the given value."
+    ArrayElement,
+    array_element,
+    array element,
+    "extracts the element with the index n from the array."
 );
 scalar_expr!(
     ArrayLength,
@@ -581,16 +613,52 @@ scalar_expr!(
     "prepends an element to the beginning of an array."
 );
 scalar_expr!(
+    ArrayRepeat,
+    array_repeat,
+    element count,
+    "returns an array containing element `count` times."
+);
+scalar_expr!(
     ArrayRemove,
     array_remove,
     array element,
-    "removes all elements equal to the given value from the array."
+    "removes the first element from the array equal to the given value."
+);
+scalar_expr!(
+    ArrayRemoveN,
+    array_remove_n,
+    array element max,
+    "removes the first `max` elements from the array equal to the given value."
+);
+scalar_expr!(
+    ArrayRemoveAll,
+    array_remove_all,
+    array element,
+    "removes all elements from the array equal to the given value."
 );
 scalar_expr!(
     ArrayReplace,
     array_replace,
     array from to,
-    "replaces a specified element with another specified element."
+    "replaces the first occurrence of the specified element with another specified element."
+);
+scalar_expr!(
+    ArrayReplaceN,
+    array_replace_n,
+    array from to max,
+    "replaces the first `max` occurrences of the specified element with another specified element."
+);
+scalar_expr!(
+    ArrayReplaceAll,
+    array_replace_all,
+    array from to,
+    "replaces all occurrences of the specified element with another specified element."
+);
+scalar_expr!(
+    ArraySlice,
+    array_slice,
+    array offset length,
+    "returns a slice of the array."
 );
 scalar_expr!(
     ArrayToString,
@@ -608,12 +676,6 @@ nary_scalar_expr!(
     MakeArray,
     array,
     "returns an Arrow array using the specified input expressions."
-);
-scalar_expr!(
-    TrimArray,
-    trim_array,
-    array n,
-    "removes the last n elements from the array."
 );
 
 // string functions
@@ -748,6 +810,7 @@ scalar_expr!(
 scalar_expr!(CurrentDate, current_date, ,"returns current UTC date as a [`DataType::Date32`] value");
 scalar_expr!(Now, now, ,"returns current timestamp in nanoseconds, using the same value for all instances of now() in same statement");
 scalar_expr!(CurrentTime, current_time, , "returns current UTC time as a [`DataType::Time64`] value");
+scalar_expr!(Nanvl, nanvl, x y, "returns x if x is not NaN otherwise returns y");
 
 scalar_expr!(ArrowTypeof, arrow_typeof, val, "data type");
 
@@ -786,7 +849,7 @@ pub fn create_udf(
 /// The signature and state type must match the `Accumulator's implementation`.
 pub fn create_udaf(
     name: &str,
-    input_type: DataType,
+    input_type: Vec<DataType>,
     return_type: Arc<DataType>,
     volatility: Volatility,
     accumulator: AccumulatorFactoryFunction,
@@ -796,7 +859,7 @@ pub fn create_udaf(
     let state_type: StateTypeFunction = Arc::new(move |_| Ok(state_type.clone()));
     AggregateUDF::new(
         name,
-        &Signature::exact(vec![input_type], volatility),
+        &Signature::exact(input_type, volatility),
         &return_type,
         &accumulator,
         &state_type,
@@ -930,7 +993,8 @@ mod test {
         test_unary_scalar_expr!(Radians, radians);
         test_nary_scalar_expr!(Round, round, input);
         test_nary_scalar_expr!(Round, round, input, decimal_places);
-        test_unary_scalar_expr!(Trunc, trunc);
+        test_nary_scalar_expr!(Trunc, trunc, num);
+        test_nary_scalar_expr!(Trunc, trunc, num, precision);
         test_unary_scalar_expr!(Abs, abs);
         test_unary_scalar_expr!(Signum, signum);
         test_unary_scalar_expr!(Exp, exp);
@@ -938,6 +1002,7 @@ mod test {
         test_unary_scalar_expr!(Log10, log10);
         test_unary_scalar_expr!(Ln, ln);
         test_scalar_expr!(Atan2, atan2, y, x);
+        test_scalar_expr!(Nanvl, nanvl, x, y);
 
         test_scalar_expr!(Ascii, ascii, input);
         test_scalar_expr!(BitLength, bit_length, string);
@@ -1003,18 +1068,21 @@ mod test {
 
         test_scalar_expr!(ArrayAppend, array_append, array, element);
         test_unary_scalar_expr!(ArrayDims, array_dims);
-        test_scalar_expr!(ArrayFill, array_fill, element, array);
         test_scalar_expr!(ArrayLength, array_length, array, dimension);
         test_unary_scalar_expr!(ArrayNdims, array_ndims);
         test_scalar_expr!(ArrayPosition, array_position, array, element, index);
         test_scalar_expr!(ArrayPositions, array_positions, array, element);
         test_scalar_expr!(ArrayPrepend, array_prepend, array, element);
+        test_scalar_expr!(ArrayRepeat, array_repeat, element, count);
         test_scalar_expr!(ArrayRemove, array_remove, array, element);
+        test_scalar_expr!(ArrayRemoveN, array_remove_n, array, element, max);
+        test_scalar_expr!(ArrayRemoveAll, array_remove_all, array, element);
         test_scalar_expr!(ArrayReplace, array_replace, array, from, to);
+        test_scalar_expr!(ArrayReplaceN, array_replace_n, array, from, to, max);
+        test_scalar_expr!(ArrayReplaceAll, array_replace_all, array, from, to);
         test_scalar_expr!(ArrayToString, array_to_string, array, delimiter);
         test_unary_scalar_expr!(Cardinality, cardinality);
         test_nary_scalar_expr!(MakeArray, array, input);
-        test_scalar_expr!(TrimArray, trim_array, array, n);
 
         test_unary_scalar_expr!(ArrowTypeof, arrow_typeof);
     }

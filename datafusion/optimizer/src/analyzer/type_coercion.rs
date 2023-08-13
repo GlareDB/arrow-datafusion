@@ -23,7 +23,9 @@ use arrow::datatypes::{DataType, IntervalUnit};
 
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{RewriteRecursion, TreeNodeRewriter};
-use datafusion_common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue};
+use datafusion_common::{
+    plan_err, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue,
+};
 use datafusion_expr::expr::{
     self, Between, BinaryExpr, Case, Exists, InList, InSubquery, Like, ScalarFunction,
     ScalarUDF, WindowFunction,
@@ -206,35 +208,29 @@ impl TreeNodeRewriter for TypeCoercionRewriter {
                 expr,
                 pattern,
                 escape_char,
+                case_insensitive,
             }) => {
                 let left_type = expr.get_type(&self.schema)?;
                 let right_type = pattern.get_type(&self.schema)?;
                 let coerced_type = like_coercion(&left_type,  &right_type).ok_or_else(|| {
+                    let op_name = if case_insensitive {
+                        "ILIKE"
+                    } else {
+                        "LIKE"
+                    };
                     DataFusionError::Plan(format!(
-                        "There isn't a common type to coerce {left_type} and {right_type} in LIKE expression"
+                        "There isn't a common type to coerce {left_type} and {right_type} in {op_name} expression"
                     ))
                 })?;
                 let expr = Box::new(expr.cast_to(&coerced_type, &self.schema)?);
                 let pattern = Box::new(pattern.cast_to(&coerced_type, &self.schema)?);
-                let expr = Expr::Like(Like::new(negated, expr, pattern, escape_char));
-                Ok(expr)
-            }
-            Expr::ILike(Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-            }) => {
-                let left_type = expr.get_type(&self.schema)?;
-                let right_type = pattern.get_type(&self.schema)?;
-                let coerced_type = like_coercion(&left_type,  &right_type).ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "There isn't a common type to coerce {left_type} and {right_type} in ILIKE expression"
-                    ))
-                })?;
-                let expr = Box::new(expr.cast_to(&coerced_type, &self.schema)?);
-                let pattern = Box::new(pattern.cast_to(&coerced_type, &self.schema)?);
-                let expr = Expr::ILike(Like::new(negated, expr, pattern, escape_char));
+                let expr = Expr::Like(Like::new(
+                    negated,
+                    expr,
+                    pattern,
+                    escape_char,
+                    case_insensitive,
+                ));
                 Ok(expr)
             }
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
@@ -299,9 +295,9 @@ impl TreeNodeRewriter for TypeCoercionRewriter {
                 let result_type =
                     get_coerce_type_for_list(&expr_data_type, &list_data_types);
                 match result_type {
-                    None => Err(DataFusionError::Plan(format!(
+                    None => plan_err!(
                         "Can not find compatible types to compare {expr_data_type:?} with {list_data_types:?}"
-                    ))),
+                    ),
                     Some(coerced_type) => {
                         // find the coerced type
                         let cast_expr = expr.cast_to(&coerced_type, &self.schema)?;
@@ -896,7 +892,7 @@ mod test {
         let empty = empty();
         let my_avg = create_udaf(
             "MY_AVG",
-            DataType::Float64,
+            vec![DataType::Float64],
             Arc::new(DataType::Float64),
             Volatility::Immutable,
             Arc::new(|_| {
@@ -998,7 +994,7 @@ mod test {
         ));
         let err = Projection::try_new(vec![agg_expr], empty).err().unwrap();
         assert_eq!(
-            "Plan(\"The function Avg does not support inputs of type Utf8.\")",
+            "Plan(\"No function matches the given name and argument types 'AVG(Utf8)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\tAVG(Int8/Int16/Int32/Int64/UInt8/UInt16/UInt32/UInt64/Float32/Float64)\")",
             &format!("{err:?}")
         );
         Ok(())
@@ -1126,7 +1122,7 @@ mod test {
         // like : utf8 like "abc"
         let expr = Box::new(col("a"));
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
-        let like_expr = Expr::Like(Like::new(false, expr, pattern, None));
+        let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Utf8);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty)?);
         let expected = "Projection: a LIKE Utf8(\"abc\")\n  EmptyRelation";
@@ -1134,7 +1130,7 @@ mod test {
 
         let expr = Box::new(col("a"));
         let pattern = Box::new(lit(ScalarValue::Null));
-        let like_expr = Expr::Like(Like::new(false, expr, pattern, None));
+        let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Utf8);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty)?);
         let expected = "Projection: a LIKE CAST(NULL AS Utf8) AS a LIKE NULL \
@@ -1143,7 +1139,7 @@ mod test {
 
         let expr = Box::new(col("a"));
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
-        let like_expr = Expr::Like(Like::new(false, expr, pattern, None));
+        let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Int64);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty)?);
         let err = assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), &plan, expected);
@@ -1155,7 +1151,7 @@ mod test {
         // ilike
         let expr = Box::new(col("a"));
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
-        let ilike_expr = Expr::ILike(Like::new(false, expr, pattern, None));
+        let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(DataType::Utf8);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty)?);
         let expected = "Projection: a ILIKE Utf8(\"abc\")\n  EmptyRelation";
@@ -1163,7 +1159,7 @@ mod test {
 
         let expr = Box::new(col("a"));
         let pattern = Box::new(lit(ScalarValue::Null));
-        let ilike_expr = Expr::ILike(Like::new(false, expr, pattern, None));
+        let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(DataType::Utf8);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty)?);
         let expected = "Projection: a ILIKE CAST(NULL AS Utf8) AS a ILIKE NULL \
@@ -1172,7 +1168,7 @@ mod test {
 
         let expr = Box::new(col("a"));
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
-        let ilike_expr = Expr::ILike(Like::new(false, expr, pattern, None));
+        let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(DataType::Int64);
         let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty)?);
         let err = assert_analyzed_plan_eq(Arc::new(TypeCoercion::new()), &plan, expected);

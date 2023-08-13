@@ -202,7 +202,7 @@ fn optimize_partitions(
                     child.clone(),
                     false, // child is not root
                     can_reorder_child,
-                    plan.benefits_from_input_partitioning(),
+                    plan.benefits_from_input_partitioning()[idx],
                     repartition_file_scans,
                     repartition_file_min_size,
                 )
@@ -396,6 +396,8 @@ mod tests {
             scan_config(false, true),
             false,
             b',',
+            b'"',
+            None,
             FileCompressionType::UNCOMPRESSED,
         ))
     }
@@ -411,6 +413,8 @@ mod tests {
             scan_config(false, false),
             false,
             b',',
+            b'"',
+            None,
             FileCompressionType::UNCOMPRESSED,
         ))
     }
@@ -426,6 +430,8 @@ mod tests {
             scan_config(true, true),
             false,
             b',',
+            b'"',
+            None,
             FileCompressionType::UNCOMPRESSED,
         ))
     }
@@ -992,6 +998,8 @@ mod tests {
                 scan_config(false, true),
                 false,
                 b',',
+                b'"',
+                None,
                 compression_type,
             )));
 

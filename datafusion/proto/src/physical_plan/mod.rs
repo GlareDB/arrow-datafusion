@@ -51,8 +51,8 @@ use datafusion_common::{DataFusionError, Result};
 use prost::bytes::BufMut;
 use prost::Message;
 
-use crate::common::proto_error;
-use crate::common::{csv_delimiter_to_string, str_to_byte};
+use crate::common::str_to_byte;
+use crate::common::{byte_to_string, proto_error};
 use crate::physical_plan::from_proto::{
     parse_physical_expr, parse_physical_sort_expr, parse_protobuf_file_scan_config,
 };
@@ -155,7 +155,16 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     registry,
                 )?,
                 scan.has_header,
-                str_to_byte(&scan.delimiter)?,
+                str_to_byte(&scan.delimiter, "delimiter")?,
+                str_to_byte(&scan.quote, "quote")?,
+                if let Some(protobuf::csv_scan_exec_node::OptionalEscape::Escape(
+                    escape,
+                )) = &scan.optional_escape
+                {
+                    Some(str_to_byte(escape, "escape")?)
+                } else {
+                    None
+                },
                 FileCompressionType::UNCOMPRESSED,
             ))),
             PhysicalPlanType::ParquetScan(scan) => {
@@ -1070,7 +1079,15 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     protobuf::CsvScanExecNode {
                         base_conf: Some(exec.base_config().try_into()?),
                         has_header: exec.has_header(),
-                        delimiter: csv_delimiter_to_string(exec.delimiter())?,
+                        delimiter: byte_to_string(exec.delimiter(), "delimiter")?,
+                        quote: byte_to_string(exec.quote(), "quote")?,
+                        optional_escape: if let Some(escape) = exec.escape() {
+                            Some(protobuf::csv_scan_exec_node::OptionalEscape::Escape(
+                                byte_to_string(escape, "escape")?,
+                            ))
+                        } else {
+                            None
+                        },
                     },
                 )),
             })
@@ -1380,18 +1397,17 @@ mod roundtrip_tests {
     use datafusion::logical_expr::create_udf;
     use datafusion::logical_expr::{BuiltinScalarFunction, Volatility};
     use datafusion::physical_expr::expressions::in_list;
+    use datafusion::physical_expr::expressions::GetFieldAccessExpr;
     use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
-    use datafusion::physical_plan::expressions::{
-        date_time_interval_expr, like, BinaryExpr, GetIndexedFieldExpr,
-    };
+    use datafusion::physical_plan::expressions::{like, BinaryExpr, GetIndexedFieldExpr};
     use datafusion::physical_plan::functions::make_scalar_function;
     use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::{functions, udaf};
     use datafusion::{
         arrow::{
             compute::kernels::sort::SortOptions,
-            datatypes::{DataType, Field, Schema},
+            datatypes::{DataType, Field, Fields, Schema},
         },
         datasource::{
             listing::PartitionedFile,
@@ -1467,7 +1483,7 @@ mod roundtrip_tests {
         let date_expr = col("some_date", &schema)?;
         let literal_expr = col("some_interval", &schema)?;
         let date_time_interval_expr =
-            date_time_interval_expr(date_expr, Operator::Plus, literal_expr, &schema)?;
+            binary(date_expr, Operator::Plus, literal_expr, &schema)?;
         let plan = Arc::new(ProjectionExec::try_new(
             vec![(date_time_interval_expr, "result".to_string())],
             input,
@@ -1902,18 +1918,83 @@ mod roundtrip_tests {
     }
 
     #[test]
-    fn roundtrip_get_indexed_field() -> Result<()> {
+    fn roundtrip_get_indexed_field_named_struct_field() -> Result<()> {
         let fields = vec![
             Field::new("id", DataType::Int64, true),
-            Field::new_list("a", Field::new("item", DataType::Float64, true), true),
+            Field::new_struct(
+                "arg",
+                Fields::from(vec![Field::new("name", DataType::Float64, true)]),
+                true,
+            ),
         ];
 
         let schema = Schema::new(fields);
         let input = Arc::new(EmptyExec::new(false, Arc::new(schema.clone())));
 
-        let col_a = col("a", &schema)?;
-        let key = ScalarValue::Int64(Some(1));
-        let get_indexed_field_expr = Arc::new(GetIndexedFieldExpr::new(col_a, key));
+        let col_arg = col("arg", &schema)?;
+        let get_indexed_field_expr = Arc::new(GetIndexedFieldExpr::new(
+            col_arg,
+            GetFieldAccessExpr::NamedStructField {
+                name: ScalarValue::Utf8(Some(String::from("name"))),
+            },
+        ));
+
+        let plan = Arc::new(ProjectionExec::try_new(
+            vec![(get_indexed_field_expr, "result".to_string())],
+            input,
+        )?);
+
+        roundtrip_test(plan)
+    }
+
+    #[test]
+    fn roundtrip_get_indexed_field_list_index() -> Result<()> {
+        let fields = vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new_list("arg", Field::new("item", DataType::Float64, true), true),
+            Field::new("key", DataType::Int64, true),
+        ];
+
+        let schema = Schema::new(fields);
+        let input = Arc::new(EmptyExec::new(false, Arc::new(schema.clone())));
+
+        let col_arg = col("arg", &schema)?;
+        let col_key = col("key", &schema)?;
+        let get_indexed_field_expr = Arc::new(GetIndexedFieldExpr::new(
+            col_arg,
+            GetFieldAccessExpr::ListIndex { key: col_key },
+        ));
+
+        let plan = Arc::new(ProjectionExec::try_new(
+            vec![(get_indexed_field_expr, "result".to_string())],
+            input,
+        )?);
+
+        roundtrip_test(plan)
+    }
+
+    #[test]
+    fn roundtrip_get_indexed_field_list_range() -> Result<()> {
+        let fields = vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new_list("arg", Field::new("item", DataType::Float64, true), true),
+            Field::new("start", DataType::Int64, true),
+            Field::new("stop", DataType::Int64, true),
+        ];
+
+        let schema = Schema::new(fields);
+        let input = Arc::new(EmptyExec::new(false, Arc::new(schema.clone())));
+
+        let col_arg = col("arg", &schema)?;
+        let col_start = col("start", &schema)?;
+        let col_stop = col("stop", &schema)?;
+        let get_indexed_field_expr = Arc::new(GetIndexedFieldExpr::new(
+            col_arg,
+            GetFieldAccessExpr::ListRange {
+                start: col_start,
+                stop: col_stop,
+            },
+        ));
 
         let plan = Arc::new(ProjectionExec::try_new(
             vec![(get_indexed_field_expr, "result".to_string())],

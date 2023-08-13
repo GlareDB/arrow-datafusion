@@ -660,6 +660,41 @@ select round(log2(a), 5), round(log2(b), 5), round(log2(c), 5) from signed_integ
 NaN 13.28771 NaN
 NaN 6.64386 NaN
 
+## nanvl
+
+# nanvl scalar function
+query RRR rowsort
+select nanvl(0, 1), nanvl(asin(10), 2), nanvl(3, asin(10));
+----
+0 2 3
+
+# nanvl scalar nulls
+query R rowsort
+select nanvl(null, 64);
+----
+NULL
+
+# nanvl scalar nulls #1
+query R rowsort
+select nanvl(2, null);
+----
+NULL
+
+# nanvl scalar nulls #2
+query R rowsort
+select nanvl(null, null);
+----
+NULL
+
+# nanvl with columns (round is needed to normalize the outputs of different operating systems)
+query RRR rowsort
+select round(nanvl(asin(f + a), 2), 5), round(nanvl(asin(b + c), 3), 5), round(nanvl(asin(d + e), 4), 5) from small_floats;
+----
+0.7754 1.11977 -0.9273
+2 -0.20136 0.7754
+2 -1.11977 4
+NULL NULL NULL
+
 ## pi
 
 # pi scalar function
@@ -912,6 +947,31 @@ select trunc(a), trunc(b), trunc(c) from small_floats;
 0 0 0
 0 0 1
 
+# trunc with precision
+query RRRRR rowsort
+select trunc(4.267, 3), trunc(1.1234, 2), trunc(-1.1231, 6), trunc(1.2837284, 2), trunc(1.1, 0);
+----
+4.267 1.12 -1.1231 1.28 1
+
+# trunc with negative precision should truncate digits left of decimal
+query R
+select trunc(12345.678, -3);
+----
+12000
+
+# trunc with columns and precision
+query RRR rowsort
+select
+  trunc(sqrt(abs(a)), 3) as a3,
+  trunc(sqrt(abs(a)), 1) as a1,
+  trunc(arrow_cast(sqrt(abs(a)), 'Float64'), 3) as a3_f64
+from small_floats;
+----
+0.447 0.4 0.447
+0.707 0.7 0.707
+0.837 0.8 0.837
+1 1 1
+
 ## bitwise and
 
 # bitwise and with column and scalar
@@ -971,6 +1031,49 @@ select a ^ b, c ^ d, e ^ f from signed_integers;
 -101 -1591 -10
 -998 -133 -16
 NULL NULL NULL
+
+# bitwise xor with other operators
+query II rowsort
+select 2 * c - 1 ^ 856 + d + 3, d ^ 7 >> 4 from signed_integers;
+----
+-3328 128
+-822 64
+686 -16
+NULL -32
+
+statement ok
+set datafusion.sql_parser.dialect = postgresql;
+
+# postgresql bitwise xor with column and scalar
+query I rowsort
+select c # 856 from signed_integers;
+----
+-138
+-367
+803
+NULL
+
+# postgresql bitwise xor with columns
+query III rowsort
+select a # b, c # d, e # f from signed_integers;
+----
+-10003 -3026 -10
+-101 -1591 -10
+-998 -133 -16
+NULL NULL NULL
+
+# postgresql bitwise xor with other operators
+query II rowsort
+select 2 * c - 1 # 856 + d + 3, d # 7 >> 4 from signed_integers;
+----
+-3328 128
+-822 64
+686 -16
+NULL -32
+
+statement ok
+set datafusion.sql_parser.dialect = generic;
+
 
 ## bitwise right shift
 
@@ -1089,6 +1192,18 @@ FROM t1
 999
 999
 999
+
+# issue: https://github.com/apache/arrow-datafusion/issues/7004
+query B
+select case c1
+    when 'foo' then TRUE
+    when 'bar' then FALSE
+end from t1
+----
+NULL
+NULL
+NULL
+NULL
 
 statement ok
 drop table t1
@@ -1479,7 +1594,6 @@ true true false true true true
 # csv query boolean gt gt eq
 query BBBBBB rowsort
 SELECT a, b, a > b as gt, b = true as gt_scalar, a >= b as gt_eq, a >= true as gt_eq_scalar FROM t1
----- 
 ----
 NULL NULL NULL NULL NULL NULL
 NULL false NULL false NULL NULL
@@ -1494,10 +1608,10 @@ true true false true true true
 # csv query boolean distinct from
 query BBBBBB rowsort
 SELECT a, b,
-      a is distinct from b as df, 
-      b is distinct from true as df_scalar, 
-      a is not distinct from b as ndf, 
-      a is not distinct from true as ndf_scalar 
+      a is distinct from b as df,
+      b is distinct from true as df_scalar,
+      a is not distinct from b as ndf,
+      a is not distinct from true as ndf_scalar
 FROM t1
 ----
 NULL NULL false true true false

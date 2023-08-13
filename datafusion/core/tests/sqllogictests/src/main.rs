@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_family = "windows")]
 use std::thread;
 
+use datafusion_sqllogictest::{DataFusion, Postgres};
 use futures::stream::StreamExt;
 use log::info;
 use sqllogictest::strict_column_validator;
@@ -28,10 +29,6 @@ use tempfile::TempDir;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::{DataFusionError, Result};
 
-use crate::engines::datafusion::DataFusion;
-use crate::engines::postgres::Postgres;
-
-mod engines;
 mod setup;
 
 const TEST_DIRECTORY: &str = "tests/sqllogictests/test_files/";
@@ -270,6 +267,14 @@ async fn context_for_test_file(relative_path: &Path) -> Option<TestContext> {
         "scalar.slt" => {
             info!("Registering scalar tables");
             setup::register_scalar_tables(test_ctx.session_ctx()).await;
+        }
+        "information_schema_table_types.slt" => {
+            info!("Registering local temporary table");
+            setup::register_temp_table(test_ctx.session_ctx()).await;
+        }
+        "information_schema_columns.slt" => {
+            info!("Registering table with many types");
+            setup::register_table_with_many_types(test_ctx.session_ctx()).await;
         }
         "avro.slt" => {
             #[cfg(feature = "avro")]

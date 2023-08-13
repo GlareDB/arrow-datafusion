@@ -34,8 +34,8 @@ use datafusion_common::tree_node::{RewriteRecursion, TreeNode, TreeNodeRewriter}
 use datafusion_common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue};
 use datafusion_expr::expr::{InList, InSubquery, ScalarFunction};
 use datafusion_expr::{
-    and, expr, lit, or, BinaryExpr, BuiltinScalarFunction, ColumnarValue, Expr, Like,
-    Volatility,
+    and, expr, lit, or, BinaryExpr, BuiltinScalarFunction, Case, ColumnarValue, Expr,
+    Like, Volatility,
 };
 use datafusion_physical_expr::{create_physical_expr, execution_props::ExecutionProps};
 
@@ -292,7 +292,6 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::Negative(_)
             | Expr::Between { .. }
             | Expr::Like { .. }
-            | Expr::ILike { .. }
             | Expr::SimilarTo { .. }
             | Expr::Case(_)
             | Expr::Cast { .. }
@@ -1069,17 +1068,20 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
             //
             // Note: the rationale for this rewrite is that the expr can then be further
             // simplified using the existing rules for AND/OR
-            Expr::Case(case)
-                if !case.when_then_expr.is_empty()
-                && case.when_then_expr.len() < 3 // The rewrite is O(n!) so limit to small number
-                && info.is_boolean_type(&case.when_then_expr[0].1)? =>
+            Expr::Case(Case {
+                expr: None,
+                when_then_expr,
+                else_expr,
+            }) if !when_then_expr.is_empty()
+                && when_then_expr.len() < 3 // The rewrite is O(n!) so limit to small number
+                && info.is_boolean_type(&when_then_expr[0].1)? =>
             {
                 // The disjunction of all the when predicates encountered so far
                 let mut filter_expr = lit(false);
                 // The disjunction of all the cases
                 let mut out_expr = lit(false);
 
-                for (when, then) in case.when_then_expr {
+                for (when, then) in when_then_expr {
                     let case_expr = when
                         .as_ref()
                         .clone()
@@ -1090,7 +1092,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                     filter_expr = filter_expr.or(*when);
                 }
 
-                if let Some(else_expr) = case.else_expr {
+                if let Some(else_expr) = else_expr {
                     let case_expr = filter_expr.not().and(*else_expr);
                     out_expr = out_expr.or(case_expr);
                 }
@@ -1163,21 +1165,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 pattern,
                 negated,
                 escape_char: _,
-            }) if !is_null(&expr)
-                && matches!(
-                    pattern.as_ref(),
-                    Expr::Literal(ScalarValue::Utf8(Some(pattern_str))) if pattern_str == "%"
-                ) =>
-            {
-                lit(!negated)
-            }
-
-            // Rules for ILike
-            Expr::ILike(Like {
-                expr,
-                pattern,
-                negated,
-                escape_char: _,
+                case_insensitive: _,
             }) if !is_null(&expr)
                 && matches!(
                     pattern.as_ref(),
@@ -2511,10 +2499,43 @@ mod tests {
             col("c1")
                 .in_list(vec![lit("foo"), lit("bar"), lit("baz"), lit("qux")], false),
         );
+        assert_change(
+            regex_match(col("c1"), lit("^(fo_o)$")),
+            col("c1").eq(lit("fo_o")),
+        );
+        assert_change(
+            regex_match(col("c1"), lit("^(fo_o)$")),
+            col("c1").eq(lit("fo_o")),
+        );
+        assert_change(
+            regex_match(col("c1"), lit("^(fo_o|ba_r)$")),
+            col("c1").eq(lit("fo_o")).or(col("c1").eq(lit("ba_r"))),
+        );
+        assert_change(
+            regex_not_match(col("c1"), lit("^(fo_o|ba_r)$")),
+            col("c1")
+                .not_eq(lit("fo_o"))
+                .and(col("c1").not_eq(lit("ba_r"))),
+        );
+        assert_change(
+            regex_match(col("c1"), lit("^(fo_o|ba_r|ba_z)$")),
+            ((col("c1").eq(lit("fo_o"))).or(col("c1").eq(lit("ba_r"))))
+                .or(col("c1").eq(lit("ba_z"))),
+        );
+        assert_change(
+            regex_match(col("c1"), lit("^(fo_o|ba_r|baz|qu_x)$")),
+            col("c1").in_list(
+                vec![lit("fo_o"), lit("ba_r"), lit("baz"), lit("qu_x")],
+                false,
+            ),
+        );
 
         // regular expressions that mismatch captured literals
         assert_no_change(regex_match(col("c1"), lit("(foo|bar)")));
         assert_no_change(regex_match(col("c1"), lit("(foo|bar)*")));
+        assert_no_change(regex_match(col("c1"), lit("(fo_o|b_ar)")));
+        assert_no_change(regex_match(col("c1"), lit("(foo|ba_r)*")));
+        assert_no_change(regex_match(col("c1"), lit("(fo_o|ba_r)*")));
         assert_no_change(regex_match(col("c1"), lit("^(foo|bar)*")));
         assert_no_change(regex_match(col("c1"), lit("^foo|bar$")));
         assert_no_change(regex_match(col("c1"), lit("^(foo)(bar)$")));
@@ -2609,6 +2630,7 @@ mod tests {
             expr: Box::new(expr),
             pattern: Box::new(lit(pattern)),
             escape_char: None,
+            case_insensitive: false,
         })
     }
 
@@ -2618,24 +2640,27 @@ mod tests {
             expr: Box::new(expr),
             pattern: Box::new(lit(pattern)),
             escape_char: None,
+            case_insensitive: false,
         })
     }
 
     fn ilike(expr: Expr, pattern: &str) -> Expr {
-        Expr::ILike(Like {
+        Expr::Like(Like {
             negated: false,
             expr: Box::new(expr),
             pattern: Box::new(lit(pattern)),
             escape_char: None,
+            case_insensitive: true,
         })
     }
 
     fn not_ilike(expr: Expr, pattern: &str) -> Expr {
-        Expr::ILike(Like {
+        Expr::Like(Like {
             negated: true,
             expr: Box::new(expr),
             pattern: Box::new(lit(pattern)),
             escape_char: None,
+            case_insensitive: true,
         })
     }
 
@@ -2819,9 +2844,9 @@ mod tests {
 
     #[test]
     fn simplify_expr_case_when_then_else() {
-        // CASE WHERE c2 != false THEN "ok" == "not_ok" ELSE c2 == true
+        // CASE WHEN c2 != false THEN "ok" == "not_ok" ELSE c2 == true
         // -->
-        // CASE WHERE c2 THEN false ELSE c2
+        // CASE WHEN c2 THEN false ELSE c2
         // -->
         // false
         assert_eq!(
@@ -2836,9 +2861,9 @@ mod tests {
             col("c2").not().and(col("c2")) // #1716
         );
 
-        // CASE WHERE c2 != false THEN "ok" == "ok" ELSE c2
+        // CASE WHEN c2 != false THEN "ok" == "ok" ELSE c2
         // -->
-        // CASE WHERE c2 THEN true ELSE c2
+        // CASE WHEN c2 THEN true ELSE c2
         // -->
         // c2
         //
@@ -2856,7 +2881,7 @@ mod tests {
             col("c2").or(col("c2").not().and(col("c2"))) // #1716
         );
 
-        // CASE WHERE ISNULL(c2) THEN true ELSE c2
+        // CASE WHEN ISNULL(c2) THEN true ELSE c2
         // -->
         // ISNULL(c2) OR c2
         //
@@ -2873,7 +2898,7 @@ mod tests {
                 .or(col("c2").is_not_null().and(col("c2")))
         );
 
-        // CASE WHERE c1 then true WHERE c2 then false ELSE true
+        // CASE WHEN c1 then true WHEN c2 then false ELSE true
         // --> c1 OR (NOT(c1) AND c2 AND FALSE) OR (NOT(c1 OR c2) AND TRUE)
         // --> c1 OR (NOT(c1) AND NOT(c2))
         // --> c1 OR NOT(c2)
@@ -2892,7 +2917,7 @@ mod tests {
             col("c1").or(col("c1").not().and(col("c2").not()))
         );
 
-        // CASE WHERE c1 then true WHERE c2 then true ELSE false
+        // CASE WHEN c1 then true WHEN c2 then true ELSE false
         // --> c1 OR (NOT(c1) AND c2 AND TRUE) OR (NOT(c1 OR c2) AND FALSE)
         // --> c1 OR (NOT(c1) AND c2)
         // --> c1 OR c2

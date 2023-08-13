@@ -62,14 +62,15 @@ use crate::{
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion_common::{DFSchema, ScalarValue};
+use datafusion_common::{plan_err, DFSchema, ScalarValue};
 use datafusion_expr::expr::{
     self, AggregateFunction, AggregateUDF, Alias, Between, BinaryExpr, Cast,
-    GetIndexedField, GroupingSet, InList, Like, ScalarUDF, TryCast, WindowFunction,
+    GetFieldAccess, GetIndexedField, GroupingSet, InList, Like, ScalarUDF, TryCast,
+    WindowFunction,
 };
 use datafusion_expr::expr_rewriter::{unalias, unnormalize_cols};
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
-use datafusion_expr::{logical_plan, DmlStatement, StringifiedPlan, WriteOp};
+use datafusion_expr::{DmlStatement, StringifiedPlan, WriteOp};
 use datafusion_expr::{WindowFrame, WindowFrameBound};
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_sql::utils::window_expr_common_partition_keys;
@@ -181,9 +182,22 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             let expr = create_physical_name(expr, false)?;
             Ok(format!("{expr} IS NOT UNKNOWN"))
         }
-        Expr::GetIndexedField(GetIndexedField { key, expr }) => {
+        Expr::GetIndexedField(GetIndexedField { expr, field }) => {
             let expr = create_physical_name(expr, false)?;
-            Ok(format!("{expr}[{key}]"))
+            let name = match field {
+                GetFieldAccess::NamedStructField { name } => format!("{expr}[{name}]"),
+                GetFieldAccess::ListIndex { key } => {
+                    let key = create_physical_name(key, false)?;
+                    format!("{expr}[{key}]")
+                }
+                GetFieldAccess::ListRange { start, stop } => {
+                    let start = create_physical_name(start, false)?;
+                    let stop = create_physical_name(stop, false)?;
+                    format!("{expr}[{start}:{stop}]")
+                }
+            };
+
+            Ok(name)
         }
         Expr::ScalarFunction(func) => {
             create_function_physical_name(&func.fun.to_string(), false, &func.args)
@@ -296,37 +310,20 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             expr,
             pattern,
             escape_char,
+            case_insensitive,
         }) => {
             let expr = create_physical_name(expr, false)?;
             let pattern = create_physical_name(pattern, false)?;
+            let op_name = if *case_insensitive { "ILIKE" } else { "LIKE" };
             let escape = if let Some(char) = escape_char {
                 format!("CHAR '{char}'")
             } else {
                 "".to_string()
             };
             if *negated {
-                Ok(format!("{expr} NOT LIKE {pattern}{escape}"))
+                Ok(format!("{expr} NOT {op_name} {pattern}{escape}"))
             } else {
-                Ok(format!("{expr} LIKE {pattern}{escape}"))
-            }
-        }
-        Expr::ILike(Like {
-            negated,
-            expr,
-            pattern,
-            escape_char,
-        }) => {
-            let expr = create_physical_name(expr, false)?;
-            let pattern = create_physical_name(pattern, false)?;
-            let escape = if let Some(char) = escape_char {
-                format!("CHAR '{char}'")
-            } else {
-                "".to_string()
-            };
-            if *negated {
-                Ok(format!("{expr} NOT ILIKE {pattern}{escape}"))
-            } else {
-                Ok(format!("{expr} ILIKE {pattern}{escape}"))
+                Ok(format!("{expr} {op_name} {pattern}{escape}"))
             }
         }
         Expr::SimilarTo(Like {
@@ -334,6 +331,7 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             expr,
             pattern,
             escape_char,
+            case_insensitive: _,
         }) => {
             let expr = create_physical_name(expr, false)?;
             let pattern = create_physical_name(pattern, false)?;
@@ -548,7 +546,7 @@ impl DefaultPhysicalPlanner {
                 }
                 LogicalPlan::Dml(DmlStatement {
                     table_name,
-                    op: WriteOp::Insert,
+                    op: WriteOp::InsertInto,
                     input,
                     ..
                 }) => {
@@ -556,7 +554,24 @@ impl DefaultPhysicalPlanner {
                     let schema = session_state.schema_for_ref(table_name)?;
                     if let Some(provider) = schema.table(name).await {
                         let input_exec = self.create_initial_plan(input, session_state).await?;
-                        provider.insert_into(session_state, input_exec).await
+                        provider.insert_into(session_state, input_exec, false).await
+                    } else {
+                        return Err(DataFusionError::Execution(format!(
+                            "Table '{table_name}' does not exist"
+                        )));
+                    }
+                }
+                LogicalPlan::Dml(DmlStatement {
+                    table_name,
+                    op: WriteOp::InsertOverwrite,
+                    input,
+                    ..
+                }) => {
+                    let name = table_name.table();
+                    let schema = session_state.schema_for_ref(table_name)?;
+                    if let Some(provider) = schema.table(name).await {
+                        let input_exec = self.create_initial_plan(input, session_state).await?;
+                        provider.insert_into(session_state, input_exec, true).await
                     } else {
                         return Err(DataFusionError::Execution(format!(
                             "Table '{table_name}' does not exist"
@@ -723,7 +738,7 @@ impl DefaultPhysicalPlanner {
                         groups.clone(),
                         aggregates.clone(),
                         filters.clone(),
-                        order_bys.clone(),
+                        order_bys,
                         input_exec,
                         physical_input_schema.clone(),
                     )?);
@@ -734,6 +749,14 @@ impl DefaultPhysicalPlanner {
                     let can_repartition = !groups.is_empty()
                         && session_state.config().target_partitions() > 1
                         && session_state.config().repartition_aggregations();
+
+                    // Some aggregators may be modified during initialization for
+                    // optimization purposes. For example, a FIRST_VALUE may turn
+                    // into a LAST_VALUE with the reverse ordering requirement.
+                    // To reflect such changes to subsequent stages, use the updated
+                    // `AggregateExpr`/`PhysicalSortExpr` objects.
+                    let updated_aggregates = initial_aggr.aggr_expr.clone();
+                    let updated_order_bys = initial_aggr.order_by_expr.clone();
 
                     let (initial_aggr, next_partition_mode): (
                         Arc<dyn ExecutionPlan>,
@@ -758,9 +781,9 @@ impl DefaultPhysicalPlanner {
                     Ok(Arc::new(AggregateExec::try_new(
                         next_partition_mode,
                         final_grouping_set,
-                        aggregates,
+                        updated_aggregates,
                         filters,
-                        order_bys,
+                        updated_order_bys,
                         initial_aggr,
                         physical_input_schema.clone(),
                     )?))
@@ -958,10 +981,9 @@ impl DefaultPhysicalPlanner {
                                 })
                                 .collect::<Vec<_>>();
                             let projection =
-                                logical_plan::Projection::try_new_with_schema(
+                                Projection::try_new(
                                     final_join_result,
                                     Arc::new(join_plan),
-                                    join_schema.clone(),
                                 )?;
                             LogicalPlan::Projection(projection)
                         } else {
@@ -1142,12 +1164,12 @@ impl DefaultPhysicalPlanner {
 
                     Ok(Arc::new(GlobalLimitExec::new(input, *skip, *fetch)))
                 }
-                LogicalPlan::Unnest(Unnest { input, column, schema }) => {
+                LogicalPlan::Unnest(Unnest { input, column, schema, options }) => {
                     let input = self.create_initial_plan(input, session_state).await?;
                     let column_exec = schema.index_of_column(column)
                         .map(|idx| Column::new(&column.name, idx))?;
                     let schema = SchemaRef::new(schema.as_ref().to_owned().into());
-                    Ok(Arc::new(UnnestExec::new(input, column_exec, schema)))
+                    Ok(Arc::new(UnnestExec::new(input, column_exec, schema, options.clone())))
                 }
                 LogicalPlan::Ddl(ddl) => {
                     // There is no default plan for DDl statements --
@@ -1215,19 +1237,20 @@ impl DefaultPhysicalPlanner {
                         ).await?;
                     }
 
-                    let plan = maybe_plan.ok_or_else(|| DataFusionError::Plan(format!(
-                        "No installed planner was able to convert the custom node to an execution plan: {:?}", e.node
-                    )))?;
+                    let plan = match maybe_plan {
+                        Some(v) => Ok(v),
+                        _ => plan_err!("No installed planner was able to convert the custom node to an execution plan: {:?}", e.node)
+                    }?;
 
                     // Ensure the ExecutionPlan's schema matches the
                     // declared logical schema to catch and warn about
                     // logic errors when creating user defined plans.
                     if !e.node.schema().matches_arrow_schema(&plan.schema()) {
-                        Err(DataFusionError::Plan(format!(
+                        plan_err!(
                             "Extension planner for {:?} created an ExecutionPlan with mismatched schema. \
                             LogicalPlan schema: {:?}, ExecutionPlan schema: {:?}",
                             e.node, e.node.schema(), plan.schema()
-                        )))
+                        )
                     } else {
                         Ok(plan)
                     }
@@ -1564,10 +1587,10 @@ pub fn create_window_expr_with_name(
                 })
                 .collect::<Result<Vec<_>>>()?;
             if !is_window_valid(window_frame) {
-                return Err(DataFusionError::Plan(format!(
+                return plan_err!(
                         "Invalid window frame: start bound ({}) cannot be larger than end bound ({})",
                         window_frame.start_bound, window_frame.end_bound
-                    )));
+                    );
             }
 
             let window_frame = Arc::new(window_frame.clone());
@@ -1581,9 +1604,7 @@ pub fn create_window_expr_with_name(
                 physical_input_schema,
             )
         }
-        other => Err(DataFusionError::Plan(format!(
-            "Invalid window expression '{other:?}'"
-        ))),
+        other => plan_err!("Invalid window expression '{other:?}'"),
     }
 }
 
@@ -2203,7 +2224,7 @@ mod tests {
                 dict_id: 0, \
                 dict_is_ordered: false, \
                 metadata: {} } }\
-        ], metadata: {} }, \
+        ], metadata: {}, functional_dependencies: FunctionalDependencies { deps: [] } }, \
         ExecutionPlan schema: Schema { fields: [\
             Field { \
                 name: \"b\", \
@@ -2427,6 +2448,7 @@ mod tests {
             );
         }
     }
+
     struct ErrorExtensionPlanner {}
 
     #[async_trait]

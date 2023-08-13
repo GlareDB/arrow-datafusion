@@ -24,7 +24,7 @@ use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::compute::{cast, concat};
 use arrow::datatypes::{DataType, Field};
 use async_trait::async_trait;
-use datafusion_common::{DataFusionError, SchemaError};
+use datafusion_common::{DataFusionError, SchemaError, UnnestOptions};
 use parquet::file::properties::WriterProperties;
 
 use datafusion_common::{Column, DFSchema, ScalarValue};
@@ -52,6 +52,33 @@ use crate::physical_plan::SendableRecordBatchStream;
 use crate::physical_plan::{collect, collect_partitioned};
 use crate::physical_plan::{execute_stream, execute_stream_partitioned, ExecutionPlan};
 use crate::prelude::SessionContext;
+
+/// Contains options that control how data is
+/// written out from a DataFrame
+pub struct DataFrameWriteOptions {
+    /// Controls if existing data should be overwritten
+    overwrite: bool, // TODO, enable DataFrame COPY TO write without TableProvider
+                     // settings such as LOCATION and FILETYPE can be set here
+                     // e.g. add location: Option<Path>
+}
+
+impl DataFrameWriteOptions {
+    /// Create a new DataFrameWriteOptions with default values
+    pub fn new() -> Self {
+        DataFrameWriteOptions { overwrite: false }
+    }
+    /// Set the overwrite option to true or false
+    pub fn with_overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
+        self
+    }
+}
+
+impl Default for DataFrameWriteOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// DataFrame represents a logical set of rows with the same named columns.
 /// Similar to a [Pandas DataFrame](https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.html) or
@@ -151,6 +178,11 @@ impl DataFrame {
 
     /// Expand each list element of a column to multiple rows.
     ///
+    /// Seee also:
+    ///
+    /// 1. [`UnnestOptions`] documentation for the behavior of `unnest`
+    /// 2. [`Self::unnest_column_with_options`]
+    ///
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -163,8 +195,21 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn unnest_column(self, column: &str) -> Result<DataFrame> {
+        self.unnest_column_with_options(column, UnnestOptions::new())
+    }
+
+    /// Expand each list element of a column to multiple rows, with
+    /// behavior controlled by [`UnnestOptions`].
+    ///
+    /// Please see the documentation on [`UnnestOptions`] for more
+    /// details about the meaning of unnest.
+    pub fn unnest_column_with_options(
+        self,
+        column: &str,
+        options: UnnestOptions,
+    ) -> Result<DataFrame> {
         let plan = LogicalPlanBuilder::from(self.plan)
-            .unnest_column(column)?
+            .unnest_column_with_options(column, options)?
             .build()?;
         Ok(DataFrame::new(self.session_state, plan))
     }
@@ -707,7 +752,8 @@ impl DataFrame {
         Ok(pretty::print_batches(&results)?)
     }
 
-    fn task_ctx(&self) -> TaskContext {
+    /// Get a new TaskContext to run in this session
+    pub fn task_ctx(&self) -> TaskContext {
         TaskContext::from(&self.session_state)
     }
 
@@ -924,6 +970,27 @@ impl DataFrame {
         ))
     }
 
+    /// Write this DataFrame to the referenced table
+    /// This method uses on the same underlying implementation
+    /// as the SQL Insert Into statement.
+    /// Unlike most other DataFrame methods, this method executes
+    /// eagerly, writing data, and returning the count of rows written.
+    pub async fn write_table(
+        self,
+        table_name: &str,
+        write_options: DataFrameWriteOptions,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let arrow_schema = Schema::from(self.schema());
+        let plan = LogicalPlanBuilder::insert_into(
+            self.plan,
+            table_name.to_owned(),
+            &arrow_schema,
+            write_options.overwrite,
+        )?
+        .build()?;
+        DataFrame::new(self.session_state, plan).collect().await
+    }
+
     /// Write a `DataFrame` to a CSV file.
     pub async fn write_csv(self, path: &str) -> Result<()> {
         let plan = self.session_state.create_physical_plan(&self.plan).await?;
@@ -1014,12 +1081,21 @@ impl DataFrame {
     /// ```
     pub fn with_column_renamed(
         self,
-        old_name: impl Into<Column>,
+        old_name: impl Into<String>,
         new_name: &str,
     ) -> Result<DataFrame> {
-        let old_name: Column = old_name.into();
+        let ident_opts = self
+            .session_state
+            .config_options()
+            .sql_parser
+            .enable_ident_normalization;
+        let old_column: Column = if ident_opts {
+            Column::from_qualified_name(old_name)
+        } else {
+            Column::from_qualified_name_ignore_case(old_name)
+        };
 
-        let field_to_rename = match self.plan.schema().field_from_column(&old_name) {
+        let field_to_rename = match self.plan.schema().field_from_column(&old_column) {
             Ok(field) => field,
             // no-op if field not found
             Err(DataFusionError::SchemaError(SchemaError::FieldNotFound { .. })) => {
@@ -1825,6 +1901,58 @@ mod tests {
                 "+-----+----+-----+----+----+-----+",
             ],
             &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_column_renamed_case_sensitive() -> Result<()> {
+        let config =
+            SessionConfig::from_string_hash_map(std::collections::HashMap::from([(
+                "datafusion.sql_parser.enable_ident_normalization".to_owned(),
+                "false".to_owned(),
+            )]))?;
+        let mut ctx = SessionContext::with_config(config);
+        let name = "aggregate_test_100";
+        register_aggregate_csv(&mut ctx, name).await?;
+        let df = ctx.table(name);
+
+        let df = df
+            .await?
+            .filter(col("c2").eq(lit(3)).and(col("c1").eq(lit("a"))))?
+            .limit(0, Some(1))?
+            .sort(vec![
+                // make the test deterministic
+                col("c1").sort(true, true),
+                col("c2").sort(true, true),
+                col("c3").sort(true, true),
+            ])?
+            .select_columns(&["c1"])?;
+
+        let df_renamed = df.clone().with_column_renamed("c1", "CoLuMn1")?;
+
+        let res = &df_renamed.clone().collect().await?;
+
+        assert_batches_sorted_eq!(
+            vec![
+                "+---------+",
+                "| CoLuMn1 |",
+                "+---------+",
+                "| a       |",
+                "+---------+",
+            ],
+            res
+        );
+
+        let df_renamed = df_renamed
+            .with_column_renamed("CoLuMn1", "c1")?
+            .collect()
+            .await?;
+
+        assert_batches_sorted_eq!(
+            vec!["+----+", "| c1 |", "+----+", "| a  |", "+----+",],
+            &df_renamed
         );
 
         Ok(())

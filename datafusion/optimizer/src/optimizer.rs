@@ -447,7 +447,9 @@ mod tests {
     use crate::optimizer::Optimizer;
     use crate::test::test_table_scan;
     use crate::{OptimizerConfig, OptimizerContext, OptimizerRule};
-    use datafusion_common::{DFField, DFSchema, DFSchemaRef, DataFusionError, Result};
+    use datafusion_common::{
+        plan_err, DFField, DFSchema, DFSchemaRef, DataFusionError, Result,
+    };
     use datafusion_expr::logical_plan::EmptyRelation;
     use datafusion_expr::{col, lit, LogicalPlan, LogicalPlanBuilder, Projection};
     use std::sync::{Arc, Mutex};
@@ -493,12 +495,12 @@ mod tests {
         assert_eq!(
             "get table_scan rule\ncaused by\n\
              Internal error: Optimizer rule 'get table_scan rule' failed, due to generate a different schema, \
-             original schema: DFSchema { fields: [], metadata: {} }, \
+             original schema: DFSchema { fields: [], metadata: {}, functional_dependencies: FunctionalDependencies { deps: [] } }, \
              new schema: DFSchema { fields: [\
              DFField { qualifier: Some(Bare { table: \"test\" }), field: Field { name: \"a\", data_type: UInt32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }, \
              DFField { qualifier: Some(Bare { table: \"test\" }), field: Field { name: \"b\", data_type: UInt32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }, \
              DFField { qualifier: Some(Bare { table: \"test\" }), field: Field { name: \"c\", data_type: UInt32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }], \
-             metadata: {} }. \
+             metadata: {}, functional_dependencies: FunctionalDependencies { deps: [] } }. \
              This was likely caused by a bug in DataFusion's code \
              and we would welcome that you file an bug report in our issue tracker",
             err.to_string()
@@ -613,7 +615,7 @@ mod tests {
             _: &LogicalPlan,
             _: &dyn OptimizerConfig,
         ) -> Result<Option<LogicalPlan>> {
-            Err(DataFusionError::Plan("rule failed".to_string()))
+            plan_err!("rule failed")
         }
 
         fn name(&self) -> &str {

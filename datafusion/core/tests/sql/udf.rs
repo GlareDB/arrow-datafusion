@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use arrow::compute::add;
+use arrow::compute::kernels::numeric::add;
 use datafusion::{
     execution::registry::FunctionRegistry,
     physical_plan::{expressions::AvgAccumulator, functions::make_scalar_function},
@@ -234,7 +234,7 @@ async fn simple_udaf() -> Result<()> {
     // define a udaf, using a DataFusion's accumulator
     let my_avg = create_udaf(
         "my_avg",
-        DataType::Float64,
+        vec![DataType::Float64],
         Arc::new(DataType::Float64),
         Volatility::Immutable,
         Arc::new(|_| {
@@ -291,7 +291,7 @@ async fn udaf_as_window_func() -> Result<()> {
 
     let my_acc = create_udaf(
         "my_acc",
-        DataType::Int32,
+        vec![DataType::Int32],
         Arc::new(DataType::Int32),
         Volatility::Immutable,
         Arc::new(|_| Ok(Box::new(MyAccumulator))),

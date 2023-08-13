@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod aggregate;
+pub mod analysis;
 pub mod array_expressions;
 pub mod conditional_expressions;
 #[cfg(feature = "crypto_expressions")]
@@ -30,6 +31,7 @@ pub mod functions;
 pub mod hash_utils;
 pub mod intervals;
 pub mod math_expressions;
+mod partitioning;
 mod physical_expr;
 pub mod planner;
 #[cfg(feature = "regex_expressions")]
@@ -46,20 +48,24 @@ pub mod utils;
 pub mod var_provider;
 pub mod window;
 
-// reexport this to maintain compatibility with anything that used from_slice previously
-pub use aggregate::groups_accumulator::{GroupsAccumulator, GroupsAccumulatorAdapter};
+pub use aggregate::groups_accumulator::{
+    EmitTo, GroupsAccumulator, GroupsAccumulatorAdapter,
+};
 pub use aggregate::AggregateExpr;
+pub use analysis::{analyze, AnalysisContext, ExprBoundaries};
 
 pub use equivalence::{
-    project_equivalence_properties, project_ordering_equivalence_properties,
-    EquivalenceProperties, EquivalentClass, OrderingEquivalenceProperties,
-    OrderingEquivalentClass,
+    ordering_equivalence_properties_helper, project_equivalence_properties,
+    project_ordering_equivalence_properties, EquivalenceProperties, EquivalentClass,
+    OrderingEquivalenceProperties, OrderingEquivalentClass,
 };
-pub use physical_expr::{AnalysisContext, ExprBoundaries, PhysicalExpr, PhysicalExprRef};
+pub use partitioning::{Distribution, Partitioning};
+pub use physical_expr::{PhysicalExpr, PhysicalExprRef};
 pub use planner::create_physical_expr;
 pub use scalar_function::ScalarFunctionExpr;
 pub use sort_expr::{
-    LexOrdering, LexOrderingReq, PhysicalSortExpr, PhysicalSortRequirement,
+    LexOrdering, LexOrderingRef, LexOrderingReq, PhysicalSortExpr,
+    PhysicalSortRequirement,
 };
 pub use utils::{
     expr_list_eq_any_order, expr_list_eq_strict_order,

@@ -93,8 +93,6 @@ pub enum Expr {
     BinaryExpr(BinaryExpr),
     /// LIKE expression
     Like(Like),
-    /// Case-insensitive LIKE expression
-    ILike(Like),
     /// LIKE expression that uses regular expressions
     SimilarTo(Like),
     /// Negation of an expression. The expression's type must be a boolean to make sense.
@@ -117,7 +115,8 @@ pub enum Expr {
     IsNotUnknown(Box<Expr>),
     /// arithmetic negation of an expression, the operand must be of a signed numeric data type
     Negative(Box<Expr>),
-    /// Returns the field of a [`arrow::array::ListArray`] or [`arrow::array::StructArray`] by key
+    /// Returns the field of a [`arrow::array::ListArray`] or
+    /// [`arrow::array::StructArray`] by index or range
     GetIndexedField(GetIndexedField),
     /// Whether an expression is between a given range.
     Between(Between),
@@ -280,6 +279,8 @@ pub struct Like {
     pub expr: Box<Expr>,
     pub pattern: Box<Expr>,
     pub escape_char: Option<char>,
+    /// Whether to ignore case on comparing
+    pub case_insensitive: bool,
 }
 
 impl Like {
@@ -289,12 +290,14 @@ impl Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         escape_char: Option<char>,
+        case_insensitive: bool,
     ) -> Self {
         Self {
             negated,
             expr,
             pattern,
             escape_char,
+            case_insensitive,
         }
     }
 }
@@ -356,19 +359,32 @@ impl ScalarUDF {
     }
 }
 
-/// Returns the field of a [`arrow::array::ListArray`] or [`arrow::array::StructArray`] by key
+/// Access a sub field of a nested type, such as `Field` or `List`
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum GetFieldAccess {
+    /// Named field, for example `struct["name"]`
+    NamedStructField { name: ScalarValue },
+    /// Single list index, for example: `list[i]`
+    ListIndex { key: Box<Expr> },
+    /// List range, for example `list[i:j]`
+    ListRange { start: Box<Expr>, stop: Box<Expr> },
+}
+
+/// Returns the field of a [`arrow::array::ListArray`] or
+/// [`arrow::array::StructArray`] by `key`. See [`GetFieldAccess`] for
+/// details.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct GetIndexedField {
-    /// the expression to take the field from
+    /// The expression to take the field from
     pub expr: Box<Expr>,
     /// The name of the field to take
-    pub key: ScalarValue,
+    pub field: GetFieldAccess,
 }
 
 impl GetIndexedField {
     /// Create a new GetIndexedField expression
-    pub fn new(expr: Box<Expr>, key: ScalarValue) -> Self {
-        Self { expr, key }
+    pub fn new(expr: Box<Expr>, field: GetFieldAccess) -> Self {
+        Self { expr, field }
     }
 }
 
@@ -691,7 +707,6 @@ impl Expr {
             Expr::IsNotNull(..) => "IsNotNull",
             Expr::IsNull(..) => "IsNull",
             Expr::Like { .. } => "Like",
-            Expr::ILike { .. } => "ILike",
             Expr::SimilarTo { .. } => "RLike",
             Expr::IsTrue(..) => "IsTrue",
             Expr::IsFalse(..) => "IsFalse",
@@ -757,22 +772,40 @@ impl Expr {
 
     /// Return `self LIKE other`
     pub fn like(self, other: Expr) -> Expr {
-        Expr::Like(Like::new(false, Box::new(self), Box::new(other), None))
+        Expr::Like(Like::new(
+            false,
+            Box::new(self),
+            Box::new(other),
+            None,
+            false,
+        ))
     }
 
     /// Return `self NOT LIKE other`
     pub fn not_like(self, other: Expr) -> Expr {
-        Expr::Like(Like::new(true, Box::new(self), Box::new(other), None))
+        Expr::Like(Like::new(
+            true,
+            Box::new(self),
+            Box::new(other),
+            None,
+            false,
+        ))
     }
 
     /// Return `self ILIKE other`
     pub fn ilike(self, other: Expr) -> Expr {
-        Expr::ILike(Like::new(false, Box::new(self), Box::new(other), None))
+        Expr::Like(Like::new(
+            false,
+            Box::new(self),
+            Box::new(other),
+            None,
+            true,
+        ))
     }
 
     /// Return `self NOT ILIKE other`
     pub fn not_ilike(self, other: Expr) -> Expr {
-        Expr::ILike(Like::new(true, Box::new(self), Box::new(other), None))
+        Expr::Like(Like::new(true, Box::new(self), Box::new(other), None, true))
     }
 
     /// Return the name to use for the specific Expr, recursing into
@@ -893,10 +926,94 @@ impl Expr {
         ))
     }
 
+    /// Return access to the named field. Example `expr["name"]`
+    ///
+    /// ## Access field "my_field" from column "c1"
+    ///
+    /// For example if column "c1" holds documents like this
+    ///
+    /// ```json
+    /// {
+    ///   "my_field": 123.34,
+    ///   "other_field": "Boston",
+    /// }
+    /// ```
+    ///
+    /// You can access column "my_field" with
+    ///
+    /// ```
+    /// # use datafusion_expr::{col};
+    /// let expr = col("c1")
+    ///    .field("my_field");
+    /// assert_eq!(expr.display_name().unwrap(), "c1[my_field]");
+    /// ```
+    pub fn field(self, name: impl Into<String>) -> Self {
+        Expr::GetIndexedField(GetIndexedField {
+            expr: Box::new(self),
+            field: GetFieldAccess::NamedStructField {
+                name: ScalarValue::Utf8(Some(name.into())),
+            },
+        })
+    }
+
+    /// Return access to the element field. Example `expr["name"]`
+    ///
+    /// ## Example Access element 2 from column "c1"
+    ///
+    /// For example if column "c1" holds documents like this
+    ///
+    /// ```json
+    /// [10, 20, 30, 40]
+    /// ```
+    ///
+    /// You can access the value "30" with
+    ///
+    /// ```
+    /// # use datafusion_expr::{lit, col, Expr};
+    /// let expr = col("c1")
+    ///    .index(lit(3));
+    /// assert_eq!(expr.display_name().unwrap(), "c1[Int32(3)]");
+    /// ```
+    pub fn index(self, key: Expr) -> Self {
+        Expr::GetIndexedField(GetIndexedField {
+            expr: Box::new(self),
+            field: GetFieldAccess::ListIndex { key: Box::new(key) },
+        })
+    }
+
+    /// Return elements between `1` based `start` and `stop`, for
+    /// example `expr[1:3]`
+    ///
+    /// ## Example: Access element 2, 3, 4 from column "c1"
+    ///
+    /// For example if column "c1" holds documents like this
+    ///
+    /// ```json
+    /// [10, 20, 30, 40]
+    /// ```
+    ///
+    /// You can access the value `[20, 30, 40]` with
+    ///
+    /// ```
+    /// # use datafusion_expr::{lit, col};
+    /// let expr = col("c1")
+    ///    .range(lit(2), lit(4));
+    /// assert_eq!(expr.display_name().unwrap(), "c1[Int32(2):Int32(4)]");
+    /// ```
+    pub fn range(self, start: Expr, stop: Expr) -> Self {
+        Expr::GetIndexedField(GetIndexedField {
+            expr: Box::new(self),
+            field: GetFieldAccess::ListRange {
+                start: Box::new(start),
+                stop: Box::new(stop),
+            },
+        })
+    }
+
     pub fn try_into_col(&self) -> Result<Column> {
         match self {
             Expr::Column(it) => Ok(it.clone()),
-            _ => plan_err!(format!("Could not coerce '{self}' into Column!")),
+            _ => plan_err!("Could not coerce '{self}' into Column!"),
         }
     }
 
@@ -1077,31 +1194,17 @@ impl fmt::Display for Expr {
                 expr,
                 pattern,
                 escape_char,
+                case_insensitive,
             }) => {
                 write!(f, "{expr}")?;
+                let op_name = if *case_insensitive { "ILIKE" } else { "LIKE" };
                 if *negated {
                     write!(f, " NOT")?;
                 }
                 if let Some(char) = escape_char {
-                    write!(f, " LIKE {pattern} ESCAPE '{char}'")
+                    write!(f, " {op_name} {pattern} ESCAPE '{char}'")
                 } else {
-                    write!(f, " LIKE {pattern}")
-                }
-            }
-            Expr::ILike(Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-            }) => {
-                write!(f, "{expr}")?;
-                if *negated {
-                    write!(f, " NOT")?;
-                }
-                if let Some(char) = escape_char {
-                    write!(f, " ILIKE {pattern} ESCAPE '{char}'")
-                } else {
-                    write!(f, " ILIKE {pattern}")
+                    write!(f, " {op_name} {pattern}")
                 }
             }
             Expr::SimilarTo(Like {
@@ -1109,6 +1212,7 @@ impl fmt::Display for Expr {
                 expr,
                 pattern,
                 escape_char,
+                case_insensitive: _,
             }) => {
                 write!(f, "{expr}")?;
                 if *negated {
@@ -1133,9 +1237,15 @@ impl fmt::Display for Expr {
             }
             Expr::Wildcard => write!(f, "*"),
             Expr::QualifiedWildcard { qualifier } => write!(f, "{qualifier}.*"),
-            Expr::GetIndexedField(GetIndexedField { key, expr }) => {
-                write!(f, "({expr})[{key}]")
-            }
+            Expr::GetIndexedField(GetIndexedField { field, expr }) => match field {
+                GetFieldAccess::NamedStructField { name } => {
+                    write!(f, "({expr})[{name}]")
+                }
+                GetFieldAccess::ListIndex { key } => write!(f, "({expr})[{key}]"),
+                GetFieldAccess::ListRange { start, stop } => {
+                    write!(f, "({expr})[{start}:{stop}]")
+                }
+            },
             Expr::GroupingSet(grouping_sets) => match grouping_sets {
                 GroupingSet::Rollup(exprs) => {
                     // ROLLUP (c0, c1, c2)
@@ -1211,30 +1321,13 @@ fn create_name(e: &Expr) -> Result<String> {
             expr,
             pattern,
             escape_char,
+            case_insensitive,
         }) => {
             let s = format!(
-                "{} {} {} {}",
+                "{} {}{} {} {}",
                 expr,
-                if *negated { "NOT LIKE" } else { "LIKE" },
-                pattern,
-                if let Some(char) = escape_char {
-                    format!("CHAR '{char}'")
-                } else {
-                    "".to_string()
-                }
-            );
-            Ok(s)
-        }
-        Expr::ILike(Like {
-            negated,
-            expr,
-            pattern,
-            escape_char,
-        }) => {
-            let s = format!(
-                "{} {} {} {}",
-                expr,
-                if *negated { "NOT ILIKE" } else { "ILIKE" },
+                if *negated { "NOT " } else { "" },
+                if *case_insensitive { "ILIKE" } else { "LIKE" },
                 pattern,
                 if let Some(char) = escape_char {
                     format!("CHAR '{char}'")
@@ -1249,6 +1342,7 @@ fn create_name(e: &Expr) -> Result<String> {
             expr,
             pattern,
             escape_char,
+            case_insensitive: _,
         }) => {
             let s = format!(
                 "{} {} {} {}",
@@ -1340,9 +1434,22 @@ fn create_name(e: &Expr) -> Result<String> {
         Expr::ScalarSubquery(subquery) => {
             Ok(subquery.subquery.schema().field(0).name().clone())
         }
-        Expr::GetIndexedField(GetIndexedField { key, expr }) => {
+        Expr::GetIndexedField(GetIndexedField { expr, field }) => {
             let expr = create_name(expr)?;
-            Ok(format!("{expr}[{key}]"))
+            match field {
+                GetFieldAccess::NamedStructField { name } => {
+                    Ok(format!("{expr}[{name}]"))
+                }
+                GetFieldAccess::ListIndex { key } => {
+                    let key = create_name(key)?;
+                    Ok(format!("{expr}[{key}]"))
+                }
+                GetFieldAccess::ListRange { start, stop } => {
+                    let start = create_name(start)?;
+                    let stop = create_name(stop)?;
+                    Ok(format!("{expr}[{start}:{stop}]"))
+                }
+            }
         }
         Expr::ScalarFunction(func) => {
             create_function_name(&func.fun.to_string(), false, &func.args)

@@ -30,19 +30,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::*;
-use arrow::compute::{concat_batches, take, SortOptions};
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatch;
-use datafusion_physical_expr::PhysicalSortRequirement;
-use futures::{Stream, StreamExt};
-
 use crate::physical_plan::expressions::Column;
 use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::joins::utils::{
-    build_join_schema, check_join_is_valid, combine_join_equivalence_properties,
-    estimate_join_statistics, partitioned_join_output_partitioning, JoinOn,
+    build_join_schema, calculate_join_output_ordering, check_join_is_valid,
+    combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
+    estimate_join_statistics, partitioned_join_output_partitioning, JoinOn, JoinSide,
 };
 use crate::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::physical_plan::{
@@ -50,13 +43,18 @@ use crate::physical_plan::{
     ExecutionPlan, Partitioning, PhysicalExpr, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_common::DataFusionError;
-use datafusion_common::JoinType;
-use datafusion_common::Result;
+
+use arrow::array::*;
+use arrow::compute::{concat_batches, take, SortOptions};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
+use datafusion_common::{plan_err, DataFusionError, JoinType, Result};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::{OrderingEquivalenceProperties, PhysicalSortRequirement};
 
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use futures::{Stream, StreamExt};
 
 /// join execution plan executes partitions in parallel and combines them into a set of
 /// partitions.
@@ -110,11 +108,11 @@ impl SortMergeJoinExec {
 
         check_join_is_valid(&left_schema, &right_schema, &on)?;
         if sort_options.len() != on.len() {
-            return Err(DataFusionError::Plan(format!(
+            return plan_err!(
                 "Expected number of sort options: {}, actual: {}",
                 on.len(),
                 sort_options.len()
-            )));
+            );
         }
 
         let (left_sort_exprs, right_sort_exprs): (Vec<_>, Vec<_>) = on
@@ -133,49 +131,15 @@ impl SortMergeJoinExec {
             })
             .unzip();
 
-        let output_ordering = match join_type {
-            JoinType::Inner
-            | JoinType::Left
-            | JoinType::LeftSemi
-            | JoinType::LeftAnti => {
-                left.output_ordering().map(|sort_exprs| sort_exprs.to_vec())
-            }
-            JoinType::RightSemi | JoinType::RightAnti => right
-                .output_ordering()
-                .map(|sort_exprs| sort_exprs.to_vec()),
-            JoinType::Right => {
-                let left_columns_len = left.schema().fields.len();
-                right
-                    .output_ordering()
-                    .map(|sort_exprs| {
-                        let new_sort_exprs: Result<Vec<PhysicalSortExpr>> = sort_exprs
-                            .iter()
-                            .map(|e| {
-                                let new_expr =
-                                    e.expr.clone().transform_down(&|e| match e
-                                        .as_any()
-                                        .downcast_ref::<Column>(
-                                    ) {
-                                        Some(col) => {
-                                            Ok(Transformed::Yes(Arc::new(Column::new(
-                                                col.name(),
-                                                left_columns_len + col.index(),
-                                            ))))
-                                        }
-                                        None => Ok(Transformed::No(e)),
-                                    });
-                                Ok(PhysicalSortExpr {
-                                    expr: new_expr?,
-                                    options: e.options,
-                                })
-                            })
-                            .collect();
-                        new_sort_exprs
-                    })
-                    .map_or(Ok(None), |v| v.map(Some))?
-            }
-            JoinType::Full => None,
-        };
+        let output_ordering = calculate_join_output_ordering(
+            left.output_ordering().unwrap_or(&[]),
+            right.output_ordering().unwrap_or(&[]),
+            join_type,
+            &on,
+            left_schema.fields.len(),
+            &Self::maintains_input_order(join_type),
+            Some(Self::probe_side(&join_type)),
+        )?;
 
         let schema =
             Arc::new(build_join_schema(&left_schema, &right_schema, &join_type).0);
@@ -193,6 +157,35 @@ impl SortMergeJoinExec {
             sort_options,
             null_equals_null,
         })
+    }
+
+    /// Get probe side (e.g streaming side) information for this sort merge join.
+    /// In current implementation, probe side is determined according to join type.
+    pub fn probe_side(join_type: &JoinType) -> JoinSide {
+        // When output schema contains only the right side, probe side is right.
+        // Otherwise probe side is the left side.
+        match join_type {
+            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
+                JoinSide::Right
+            }
+            JoinType::Inner
+            | JoinType::Left
+            | JoinType::Full
+            | JoinType::LeftAnti
+            | JoinType::LeftSemi => JoinSide::Left,
+        }
+    }
+
+    /// Calculate order preservation flags for this sort merge join.
+    fn maintains_input_order(join_type: JoinType) -> Vec<bool> {
+        match join_type {
+            JoinType::Inner => vec![true, false],
+            JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => vec![true, false],
+            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
+                vec![false, true]
+            }
+            _ => vec![false, false],
+        }
     }
 
     /// Set of common columns used to join on
@@ -273,14 +266,7 @@ impl ExecutionPlan for SortMergeJoinExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        match self.join_type {
-            JoinType::Inner => vec![true, true],
-            JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => vec![true, false],
-            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
-                vec![false, true]
-            }
-            _ => vec![false, false],
-        }
+        Self::maintains_input_order(self.join_type)
     }
 
     fn equivalence_properties(&self) -> EquivalenceProperties {
@@ -293,6 +279,19 @@ impl ExecutionPlan for SortMergeJoinExec {
             self.on(),
             self.schema(),
         )
+    }
+
+    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
+        combine_join_ordering_equivalence_properties(
+            &self.join_type,
+            &self.left,
+            &self.right,
+            self.schema(),
+            &self.maintains_input_order(),
+            Some(Self::probe_side(&self.join_type)),
+            self.equivalence_properties(),
+        )
+        .unwrap()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -331,25 +330,13 @@ impl ExecutionPlan for SortMergeJoinExec {
                  consider using RepartitionExec",
             )));
         }
-
-        let (streamed, buffered, on_streamed, on_buffered) = match self.join_type {
-            JoinType::Inner
-            | JoinType::Left
-            | JoinType::Full
-            | JoinType::LeftAnti
-            | JoinType::LeftSemi => (
-                self.left.clone(),
-                self.right.clone(),
-                self.on.iter().map(|on| on.0.clone()).collect(),
-                self.on.iter().map(|on| on.1.clone()).collect(),
-            ),
-            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => (
-                self.right.clone(),
-                self.left.clone(),
-                self.on.iter().map(|on| on.1.clone()).collect(),
-                self.on.iter().map(|on| on.0.clone()).collect(),
-            ),
-        };
+        let (on_left, on_right) = self.on.iter().cloned().unzip();
+        let (streamed, buffered, on_streamed, on_buffered) =
+            if SortMergeJoinExec::probe_side(&self.join_type) == JoinSide::Left {
+                (self.left.clone(), self.right.clone(), on_left, on_right)
+            } else {
+                (self.right.clone(), self.left.clone(), on_right, on_left)
+            };
 
         // execute children plans
         let streamed = streamed.execute(partition, context.clone())?;
@@ -1402,6 +1389,8 @@ mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::TaskContext;
 
     use crate::common::assert_contains;
     use crate::physical_plan::expressions::Column;
@@ -1409,7 +1398,6 @@ mod tests {
     use crate::physical_plan::joins::SortMergeJoinExec;
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::{common, ExecutionPlan};
-    use crate::prelude::{SessionConfig, SessionContext};
     use crate::test::{build_table_i32, columns};
     use crate::{assert_batches_eq, assert_batches_sorted_eq};
     use datafusion_common::JoinType;
@@ -1550,8 +1538,7 @@ mod tests {
         sort_options: Vec<SortOptions>,
         null_equals_null: bool,
     ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let join = join_with_options(
             left,
             right,
@@ -1573,9 +1560,9 @@ mod tests {
         on: JoinOn,
         join_type: JoinType,
     ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
-        let session_ctx =
-            SessionContext::with_config(SessionConfig::new().with_batch_size(2));
-        let task_ctx = session_ctx.task_ctx();
+        let task_ctx = TaskContext::default()
+            .with_session_config(SessionConfig::new().with_batch_size(2));
+        let task_ctx = Arc::new(task_ctx);
         let join = join(left, right, on, join_type)?;
         let columns = columns(&join.schema());
 
@@ -2334,8 +2321,12 @@ mod tests {
             let runtime_config = RuntimeConfig::new().with_memory_limit(100, 1.0);
             let runtime = Arc::new(RuntimeEnv::new(runtime_config)?);
             let session_config = SessionConfig::default().with_batch_size(50);
-            let session_ctx = SessionContext::with_config_rt(session_config, runtime);
-            let task_ctx = session_ctx.task_ctx();
+
+            let task_ctx = TaskContext::default()
+                .with_session_config(session_config)
+                .with_runtime(runtime);
+            let task_ctx = Arc::new(task_ctx);
+
             let join = join_with_options(
                 left.clone(),
                 right.clone(),
@@ -2410,8 +2401,10 @@ mod tests {
             let runtime_config = RuntimeConfig::new().with_memory_limit(100, 1.0);
             let runtime = Arc::new(RuntimeEnv::new(runtime_config)?);
             let session_config = SessionConfig::default().with_batch_size(50);
-            let session_ctx = SessionContext::with_config_rt(session_config, runtime);
-            let task_ctx = session_ctx.task_ctx();
+            let task_ctx = TaskContext::default()
+                .with_session_config(session_config)
+                .with_runtime(runtime);
+            let task_ctx = Arc::new(task_ctx);
             let join = join_with_options(
                 left.clone(),
                 right.clone(),

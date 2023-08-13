@@ -36,8 +36,8 @@ use arrow::datatypes::{
 };
 use datafusion_common::{Column, DFField, DFSchemaRef, OwnedTableReference, ScalarValue};
 use datafusion_expr::expr::{
-    self, Alias, Between, BinaryExpr, Cast, GetIndexedField, GroupingSet, InList, Like,
-    Placeholder, ScalarFunction, ScalarUDF, Sort,
+    self, Alias, Between, BinaryExpr, Cast, GetFieldAccess, GetIndexedField, GroupingSet,
+    InList, Like, Placeholder, ScalarFunction, ScalarUDF, Sort,
 };
 use datafusion_expr::{
     logical_plan::PlanType, logical_plan::StringifiedPlan, AggregateFunction,
@@ -384,6 +384,15 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
             AggregateFunction::Stddev => Self::Stddev,
             AggregateFunction::StddevPop => Self::StddevPop,
             AggregateFunction::Correlation => Self::Correlation,
+            AggregateFunction::RegrSlope => Self::RegrSlope,
+            AggregateFunction::RegrIntercept => Self::RegrIntercept,
+            AggregateFunction::RegrCount => Self::RegrCount,
+            AggregateFunction::RegrR2 => Self::RegrR2,
+            AggregateFunction::RegrAvgx => Self::RegrAvgx,
+            AggregateFunction::RegrAvgy => Self::RegrAvgy,
+            AggregateFunction::RegrSXX => Self::RegrSxx,
+            AggregateFunction::RegrSYY => Self::RegrSyy,
+            AggregateFunction::RegrSXY => Self::RegrSxy,
             AggregateFunction::ApproxPercentileCont => Self::ApproxPercentileCont,
             AggregateFunction::ApproxPercentileContWithWeight => {
                 Self::ApproxPercentileContWithWeight
@@ -526,31 +535,34 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                 expr,
                 pattern,
                 escape_char,
+                case_insensitive,
             }) => {
-                let pb = Box::new(protobuf::LikeNode {
-                    negated: *negated,
-                    expr: Some(Box::new(expr.as_ref().try_into()?)),
-                    pattern: Some(Box::new(pattern.as_ref().try_into()?)),
-                    escape_char: escape_char.map(|ch| ch.to_string()).unwrap_or_default(),
-                });
-                Self {
-                    expr_type: Some(ExprType::Like(pb)),
-                }
-            }
-            Expr::ILike(Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-            }) => {
-                let pb = Box::new(protobuf::ILikeNode {
-                    negated: *negated,
-                    expr: Some(Box::new(expr.as_ref().try_into()?)),
-                    pattern: Some(Box::new(pattern.as_ref().try_into()?)),
-                    escape_char: escape_char.map(|ch| ch.to_string()).unwrap_or_default(),
-                });
-                Self {
-                    expr_type: Some(ExprType::Ilike(pb)),
+                if *case_insensitive {
+                    let pb = Box::new(protobuf::ILikeNode {
+                        negated: *negated,
+                        expr: Some(Box::new(expr.as_ref().try_into()?)),
+                        pattern: Some(Box::new(pattern.as_ref().try_into()?)),
+                        escape_char: escape_char
+                            .map(|ch| ch.to_string())
+                            .unwrap_or_default(),
+                    });
+
+                    Self {
+                        expr_type: Some(ExprType::Ilike(pb)),
+                    }
+                } else {
+                    let pb = Box::new(protobuf::LikeNode {
+                        negated: *negated,
+                        expr: Some(Box::new(expr.as_ref().try_into()?)),
+                        pattern: Some(Box::new(pattern.as_ref().try_into()?)),
+                        escape_char: escape_char
+                            .map(|ch| ch.to_string())
+                            .unwrap_or_default(),
+                    });
+
+                    Self {
+                        expr_type: Some(ExprType::Like(pb)),
+                    }
                 }
             }
             Expr::SimilarTo(Like {
@@ -558,6 +570,7 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                 expr,
                 pattern,
                 escape_char,
+                case_insensitive: _,
             }) => {
                 let pb = Box::new(protobuf::SimilarToNode {
                     negated: *negated,
@@ -671,6 +684,21 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                     AggregateFunction::Correlation => {
                         protobuf::AggregateFunction::Correlation
                     }
+                    AggregateFunction::RegrSlope => {
+                        protobuf::AggregateFunction::RegrSlope
+                    }
+                    AggregateFunction::RegrIntercept => {
+                        protobuf::AggregateFunction::RegrIntercept
+                    }
+                    AggregateFunction::RegrR2 => protobuf::AggregateFunction::RegrR2,
+                    AggregateFunction::RegrAvgx => protobuf::AggregateFunction::RegrAvgx,
+                    AggregateFunction::RegrAvgy => protobuf::AggregateFunction::RegrAvgy,
+                    AggregateFunction::RegrCount => {
+                        protobuf::AggregateFunction::RegrCount
+                    }
+                    AggregateFunction::RegrSXX => protobuf::AggregateFunction::RegrSxx,
+                    AggregateFunction::RegrSYY => protobuf::AggregateFunction::RegrSyy,
+                    AggregateFunction::RegrSXY => protobuf::AggregateFunction::RegrSxy,
                     AggregateFunction::ApproxMedian => {
                         protobuf::AggregateFunction::ApproxMedian
                     }
@@ -947,14 +975,41 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                 // see discussion in https://github.com/apache/arrow-datafusion/issues/2565
                 return Err(Error::General("Proto serialization error: Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists { .. } | Exp:OuterReferenceColumn not supported".to_string()));
             }
-            Expr::GetIndexedField(GetIndexedField { key, expr }) => Self {
-                expr_type: Some(ExprType::GetIndexedField(Box::new(
-                    protobuf::GetIndexedField {
-                        key: Some(key.try_into()?),
-                        expr: Some(Box::new(expr.as_ref().try_into()?)),
-                    },
-                ))),
-            },
+            Expr::GetIndexedField(GetIndexedField { expr, field }) => {
+                let field = match field {
+                    GetFieldAccess::NamedStructField { name } => {
+                        protobuf::get_indexed_field::Field::NamedStructField(
+                            protobuf::NamedStructField {
+                                name: Some(name.try_into()?),
+                            },
+                        )
+                    }
+                    GetFieldAccess::ListIndex { key } => {
+                        protobuf::get_indexed_field::Field::ListIndex(Box::new(
+                            protobuf::ListIndex {
+                                key: Some(Box::new(key.as_ref().try_into()?)),
+                            },
+                        ))
+                    }
+                    GetFieldAccess::ListRange { start, stop } => {
+                        protobuf::get_indexed_field::Field::ListRange(Box::new(
+                            protobuf::ListRange {
+                                start: Some(Box::new(start.as_ref().try_into()?)),
+                                stop: Some(Box::new(stop.as_ref().try_into()?)),
+                            },
+                        ))
+                    }
+                };
+
+                Self {
+                    expr_type: Some(ExprType::GetIndexedField(Box::new(
+                        protobuf::GetIndexedField {
+                            expr: Some(Box::new(expr.as_ref().try_into()?)),
+                            field: Some(field),
+                        },
+                    ))),
+                }
+            }
 
             Expr::GroupingSet(GroupingSet::Cube(exprs)) => Self {
                 expr_type: Some(ExprType::Cube(CubeNode {
@@ -1132,6 +1187,24 @@ impl TryFrom<&ScalarValue> for protobuf::ScalarValue {
                     let vec_val: Vec<u8> = array.to_vec();
                     Ok(protobuf::ScalarValue {
                         value: Some(Value::Decimal128Value(protobuf::Decimal128 {
+                            value: vec_val,
+                            p: *p as i64,
+                            s: *s as i64,
+                        })),
+                    })
+                }
+                None => Ok(protobuf::ScalarValue {
+                    value: Some(protobuf::scalar_value::Value::NullValue(
+                        (&data_type).try_into()?,
+                    )),
+                }),
+            },
+            ScalarValue::Decimal256(val, p, s) => match *val {
+                Some(v) => {
+                    let array = v.to_be_bytes();
+                    let vec_val: Vec<u8> = array.to_vec();
+                    Ok(protobuf::ScalarValue {
+                        value: Some(Value::Decimal256Value(protobuf::Decimal256 {
                             value: vec_val,
                             p: *p as i64,
                             s: *s as i64,
@@ -1378,20 +1451,28 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::ToTimestamp => Self::ToTimestamp,
             BuiltinScalarFunction::ArrayAppend => Self::ArrayAppend,
             BuiltinScalarFunction::ArrayConcat => Self::ArrayConcat,
-            BuiltinScalarFunction::ArrayContains => Self::ArrayContains,
+            BuiltinScalarFunction::ArrayHasAll => Self::ArrayHasAll,
+            BuiltinScalarFunction::ArrayHasAny => Self::ArrayHasAny,
+            BuiltinScalarFunction::ArrayHas => Self::ArrayHas,
             BuiltinScalarFunction::ArrayDims => Self::ArrayDims,
-            BuiltinScalarFunction::ArrayFill => Self::ArrayFill,
+            BuiltinScalarFunction::ArrayElement => Self::ArrayElement,
+            BuiltinScalarFunction::Flatten => Self::Flatten,
             BuiltinScalarFunction::ArrayLength => Self::ArrayLength,
             BuiltinScalarFunction::ArrayNdims => Self::ArrayNdims,
             BuiltinScalarFunction::ArrayPosition => Self::ArrayPosition,
             BuiltinScalarFunction::ArrayPositions => Self::ArrayPositions,
             BuiltinScalarFunction::ArrayPrepend => Self::ArrayPrepend,
+            BuiltinScalarFunction::ArrayRepeat => Self::ArrayRepeat,
             BuiltinScalarFunction::ArrayRemove => Self::ArrayRemove,
+            BuiltinScalarFunction::ArrayRemoveN => Self::ArrayRemoveN,
+            BuiltinScalarFunction::ArrayRemoveAll => Self::ArrayRemoveAll,
             BuiltinScalarFunction::ArrayReplace => Self::ArrayReplace,
+            BuiltinScalarFunction::ArrayReplaceN => Self::ArrayReplaceN,
+            BuiltinScalarFunction::ArrayReplaceAll => Self::ArrayReplaceAll,
+            BuiltinScalarFunction::ArraySlice => Self::ArraySlice,
             BuiltinScalarFunction::ArrayToString => Self::ArrayToString,
             BuiltinScalarFunction::Cardinality => Self::Cardinality,
             BuiltinScalarFunction::MakeArray => Self::Array,
-            BuiltinScalarFunction::TrimArray => Self::TrimArray,
             BuiltinScalarFunction::NullIf => Self::NullIf,
             BuiltinScalarFunction::DatePart => Self::DatePart,
             BuiltinScalarFunction::DateTrunc => Self::DateTrunc,
@@ -1442,6 +1523,7 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Struct => Self::StructFun,
             BuiltinScalarFunction::FromUnixtime => Self::FromUnixtime,
             BuiltinScalarFunction::Atan2 => Self::Atan2,
+            BuiltinScalarFunction::Nanvl => Self::Nanvl,
             BuiltinScalarFunction::ArrowTypeof => Self::ArrowTypeof,
         };
 

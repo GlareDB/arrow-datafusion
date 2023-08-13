@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
-use datafusion_common::{DataFusionError, Result, ScalarValue};
+use datafusion_common::{Constraints, DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
     CreateMemoryTable, DdlStatement, Expr, LogicalPlan, LogicalPlanBuilder,
 };
@@ -27,6 +27,7 @@ use sqlparser::ast::{
     Expr as SQLExpr, Offset as SQLOffset, OrderByExpr, Query, SetExpr, Value,
 };
 
+use datafusion_common::plan_err;
 use sqlparser::parser::ParserError::ParserError;
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
@@ -86,7 +87,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 let select_into = select.into.unwrap();
                 LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
                     name: self.object_name_to_table_reference(select_into.name)?,
-                    primary_key: Vec::new(),
+                    constraints: Constraints::empty(),
                     input: Arc::new(plan),
                     if_not_exists: false,
                     or_replace: false,
@@ -117,15 +118,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             )? {
                 Expr::Literal(ScalarValue::Int64(Some(s))) => {
                     if s < 0 {
-                        return Err(DataFusionError::Plan(format!(
-                            "Offset must be >= 0, '{s}' was provided."
-                        )));
+                        return plan_err!("Offset must be >= 0, '{s}' was provided.");
                     }
                     Ok(s as usize)
                 }
-                _ => Err(DataFusionError::Plan(
-                    "Unexpected expression in OFFSET clause".to_string(),
-                )),
+                _ => plan_err!("Unexpected expression in OFFSET clause"),
             }?,
             _ => 0,
         };
@@ -142,9 +139,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     Expr::Literal(ScalarValue::Int64(Some(n))) if n >= 0 => {
                         Ok(n as usize)
                     }
-                    _ => Err(DataFusionError::Plan(
-                        "LIMIT must not be negative".to_string(),
-                    )),
+                    _ => plan_err!("LIMIT must not be negative"),
                 }?;
                 Some(n)
             }

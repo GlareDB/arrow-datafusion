@@ -43,6 +43,7 @@
 - [log](#log)
 - [log10](#log10)
 - [log2](#log2)
+- [nanvl](#nanvl)
 - [pi](#pi)
 - [power](#power)
 - [pow](#pow)
@@ -353,6 +354,22 @@ log2(numeric_expression)
 - **numeric_expression**: Numeric expression to operate on.
   Can be a constant, column, or function, and any combination of arithmetic operators.
 
+### `nanvl`
+
+Returns the first argument if it's not _NaN_.
+Returns the second argument otherwise.
+
+```
+nanvl(expression_x, expression_y)
+```
+
+#### Arguments
+
+- **expression_x**: Numeric expression to return if it's not _NaN_.
+  Can be a constant, column, or function, and any combination of arithmetic operators.
+- **expression_y**: Numeric expression to return if the first expression is _NaN_.
+  Can be a constant, column, or function, and any combination of arithmetic operators.
+
 ### `pi`
 
 Returns an approximate value of π.
@@ -396,7 +413,6 @@ radians(numeric_expression)
 
 - **numeric_expression**: Numeric expression to operate on.
   Can be a constant, column, or function, and any combination of arithmetic operators.
-  =======
 
 ### `random`
 
@@ -504,16 +520,22 @@ tanh(numeric_expression)
 
 ### `trunc`
 
-Truncates a number toward zero (at the decimal point).
+Truncates a number to a whole number or truncated to the specified decimal places.
 
 ```
-trunc(numeric_expression)
+trunc(numeric_expression[, decimal_places])
 ```
 
 #### Arguments
 
 - **numeric_expression**: Numeric expression to operate on.
   Can be a constant, column, or function, and any combination of arithmetic operators.
+
+- **decimal_places**: Optional. The number of decimal places to
+  truncate to. Defaults to 0 (truncate to a whole number). If
+  `decimal_places` is a positive integer, truncates digits to the
+  right of the decimal point. If `decimal_places` is a negative
+  integer, replaces digits to the left of the decimal point with `0`.
 
 ## Conditional Functions
 
@@ -1420,20 +1442,57 @@ from_unixtime(expression)
 ## Array Functions
 
 - [array_append](#array_append)
+- [array_cat](#array_cat)
 - [array_concat](#array_concat)
 - [array_contains](#array_contains)
 - [array_dims](#array_dims)
-- [array_fill](#array_fill)
+- [array_element](#array_element)
+- [array_extract](#array_extract)
+- [array_indexof](#array_indexof)
+- [array_join](#array_join)
 - [array_length](#array_length)
 - [array_ndims](#array_ndims)
+- [array_prepend](#array_prepend)
 - [array_position](#array_position)
 - [array_positions](#array_positions)
-- [array_prepend](#array_prepend)
+- [array_push_back](#array_push_back)
+- [array_push_front](#array_push_front)
+- [array_repeat](#array_repeat)
 - [array_remove](#array_remove)
+- [array_remove_n](#array_remove_n)
+- [array_remove_all](#array_remove_all)
 - [array_replace](#array_replace)
+- [array_replace_n](#array_replace_n)
+- [array_replace_all](#array_replace_all)
+- [array_slice](#array_slice)
 - [array_to_string](#array_to_string)
 - [cardinality](#cardinality)
+- [list_append](#list_append)
+- [list_cat](#list_cat)
+- [list_concat](#list_concat)
+- [list_dims](#list_dims)
+- [list_element](#list_element)
+- [list_extract](#list_extract)
+- [list_indexof](#list_indexof)
+- [list_join](#list_join)
+- [list_length](#list_length)
+- [list_ndims](#list_ndims)
+- [list_prepend](#list_prepend)
+- [list_position](#list_position)
+- [list_positions](#list_positions)
+- [list_push_back](#list_push_back)
+- [list_push_front](#list_push_front)
+- [list_repeat](#list_repeat)
+- [list_remove](#list_remove)
+- [list_remove_n](#list_remove_n)
+- [list_remove_all](#list_remove_all)
+- [list_replace](#list_replace)
+- [list_replace_n](#list_replace_n)
+- [list_replace_all](#list_replace_all)
+- [list_slice](#list_slice)
+- [list_to_string](#list_to_string)
 - [make_array](#make_array)
+- [make_list](#make_list)
 - [trim_array](#trim_array)
 
 ### `array_append`
@@ -1450,6 +1509,27 @@ array_append(array, element)
   Can be a constant, column, or function, and any combination of array operators.
 - **element**: Element to append to the array.
 
+#### Example
+
+```
+❯ select array_append([1, 2, 3], 4);
++--------------------------------------+
+| array_append(List([1,2,3]),Int64(4)) |
++--------------------------------------+
+| [1, 2, 3, 4]                         |
++--------------------------------------+
+```
+
+#### Aliases
+
+- array_push_back
+- list_append
+- list_push_back
+
+### `array_cat`
+
+_Alias of [array_concat](#array_concat)._
+
 ### `array_concat`
 
 Concatenates arrays.
@@ -1464,19 +1544,66 @@ array_concat(array[, ..., array_n])
   Can be a constant, column, or function, and any combination of array operators.
 - **array_n**: Subsequent array column or literal array to concatenate.
 
-### `array_contains`
-
-Returns true, if each element of the second array appears in the first array, otherwise false.
+#### Example
 
 ```
-array_contains(first_array, second_array)
+❯ select array_concat([1, 2], [3, 4], [5, 6]);
++---------------------------------------------------+
+| array_concat(List([1,2]),List([3,4]),List([5,6])) |
++---------------------------------------------------+
+| [1, 2, 3, 4, 5, 6]                                |
++---------------------------------------------------+
+```
+
+#### Aliases
+
+- array_cat
+- list_cat
+- list_concat
+
+### `array_has`
+
+Returns true if the array contains the element
+
+```
+array_has(array, element)
 ```
 
 #### Arguments
 
-- **first_array**: Array expression.
+- **array**: Array expression.
   Can be a constant, column, or function, and any combination of array operators.
-- **second_array**: Array expression.
+- **element**: Scalar or Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+
+### `array_has_all`
+
+Returns true if all elements of sub-array exist in array
+
+```
+array_has_all(array, sub-array)
+```
+
+#### Arguments
+
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **sub-array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+
+### `array_has_any`
+
+Returns true if any elements exist in both arrays
+
+```
+array_has_any(array, sub-array)
+```
+
+#### Arguments
+
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **sub-array**: Array expression.
   Can be a constant, column, or function, and any combination of array operators.
 
 ### `array_dims`
@@ -1492,9 +1619,61 @@ array_dims(array)
 - **array**: Array expression.
   Can be a constant, column, or function, and any combination of array operators.
 
+#### Example
+
+```
+❯ select array_dims([[1, 2, 3], [4, 5, 6]]);
++---------------------------------+
+| array_dims(List([1,2,3,4,5,6])) |
++---------------------------------+
+| [2, 3]                          |
++---------------------------------+
+```
+
+#### Aliases
+
+- list_dims
+
+### `array_element`
+
+Extracts the element with the index n from the array.
+
+```
+array_element(array, index)
+```
+
+#### Arguments
+
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **index**: Index to extract the element from the array.
+
+#### Example
+
+```
+❯ select array_element([1, 2, 3, 4], 3);
++-----------------------------------------+
+| array_element(List([1,2,3,4]),Int64(3)) |
++-----------------------------------------+
+| 3                                       |
++-----------------------------------------+
+```
+
+#### Aliases
+
+- array_extract
+- list_element
+- list_extract
+
+### `array_extract`
+
+_Alias of [array_element](#array_element)._
+
 ### `array_fill`
 
 Returns an array filled with copies of the given value.
+
+DEPRECATED: use `array_repeat` instead!
 
 ```
 array_fill(element, array)
@@ -1505,6 +1684,32 @@ array_fill(element, array)
 - **array**: Array expression.
   Can be a constant, column, or function, and any combination of array operators.
 - **element**: Element to copy to the array.
+
+### `flatten`
+
+Converts an array of arrays to a flat array
+
+- Applies to any depth of nested arrays
+- Does not change arrays that are already flat
+
+The flattened array contains all the elements from all source arrays.
+
+#### Arguments
+
+- **array**: Array expression
+  Can be a constant, column, or function, and any combination of array operators.
+
+```
+flatten(array)
+```
+
+### `array_indexof`
+
+_Alias of [array_position](#array_position)._
+
+### `array_join`
+
+_Alias of [array_to_string](#array_to_string)._
 
 ### `array_length`
 
@@ -1520,6 +1725,21 @@ array_length(array, dimension)
   Can be a constant, column, or function, and any combination of array operators.
 - **dimension**: Array dimension.
 
+#### Example
+
+```
+❯ select array_length([1, 2, 3, 4, 5]);
++---------------------------------+
+| array_length(List([1,2,3,4,5])) |
++---------------------------------+
+| 5                               |
++---------------------------------+
+```
+
+#### Aliases
+
+- list_length
+
 ### `array_ndims`
 
 Returns the number of dimensions of the array.
@@ -1532,6 +1752,52 @@ array_ndims(array, element)
 
 - **array**: Array expression.
   Can be a constant, column, or function, and any combination of array operators.
+
+#### Example
+
+```
+❯ select array_ndims([[1, 2, 3], [4, 5, 6]]);
++----------------------------------+
+| array_ndims(List([1,2,3,4,5,6])) |
++----------------------------------+
+| 2                                |
++----------------------------------+
+```
+
+#### Aliases
+
+- list_ndims
+
+### `array_prepend`
+
+Prepends an element to the beginning of an array.
+
+```
+array_prepend(element, array)
+```
+
+#### Arguments
+
+- **element**: Element to prepend to the array.
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+
+#### Example
+
+```
+❯ select array_prepend(1, [2, 3, 4]);
++---------------------------------------+
+| array_prepend(Int64(1),List([2,3,4])) |
++---------------------------------------+
+| [1, 2, 3, 4]                          |
++---------------------------------------+
+```
+
+#### Aliases
+
+- array_push_front
+- list_prepend
+- list_push_front
 
 ### `array_position`
 
@@ -1549,6 +1815,23 @@ array_position(array, element, index)
 - **element**: Element to search for position in the array.
 - **index**: Index at which to start searching.
 
+#### Example
+
+```
+❯ select array_position([1, 2, 2, 3, 1, 4], 2);
++----------------------------------------------+
+| array_position(List([1,2,2,3,1,4]),Int64(2)) |
++----------------------------------------------+
+| 2                                            |
++----------------------------------------------+
+```
+
+#### Aliases
+
+- array_indexof
+- list_indexof
+- list_position
+
 ### `array_positions`
 
 Searches for an element in the array, returns all occurrences.
@@ -1563,23 +1846,66 @@ array_positions(array, element)
   Can be a constant, column, or function, and any combination of array operators.
 - **element**: Element to search for positions in the array.
 
-### `array_prepend`
-
-Prepends an element to the beginning of an array.
+#### Example
 
 ```
-array_prepend(element, array)
+❯ select array_positions([1, 2, 2, 3, 1, 4], 2);
++-----------------------------------------------+
+| array_positions(List([1,2,2,3,1,4]),Int64(2)) |
++-----------------------------------------------+
+| [2, 3]                                        |
++-----------------------------------------------+
+```
+
+#### Aliases
+
+- list_positions
+
+### `array_push_back`
+
+_Alias of [array_append](#array_append)._
+
+### `array_push_front`
+
+_Alias of [array_prepend](#array_prepend)._
+
+### `array_repeat`
+
+Returns an array containing element `count` times.
+
+```
+array_repeat(element, count)
 ```
 
 #### Arguments
 
-- **element**: Element to prepend to the array.
-- **array**: Array expression.
+- **element**: Element expression.
   Can be a constant, column, or function, and any combination of array operators.
+- **count**: Value of how many times to repeat the element.
+
+#### Example
+
+```
+❯ select array_repeat(1, 3);
++---------------------------------+
+| array_repeat(Int64(1),Int64(3)) |
++---------------------------------+
+| [1, 1, 1]                       |
++---------------------------------+
+```
+
+```
+❯ select array_repeat([1, 2], 2);
++------------------------------------+
+| array_repeat(List([1,2]),Int64(2)) |
++------------------------------------+
+| [[1, 2], [1, 2]]                   |
++------------------------------------+
+```
 
 ### `array_remove`
 
-Removes all elements equal to the given value from the array.
+Removes the first element from the array equal to the given value.
 
 ```
 array_remove(array, element)
@@ -1591,9 +1917,83 @@ array_remove(array, element)
   Can be a constant, column, or function, and any combination of array operators.
 - **element**: Element to be removed from the array.
 
+#### Example
+
+```
+❯ select array_remove([1, 2, 2, 3, 2, 1, 4], 2);
++----------------------------------------------+
+| array_remove(List([1,2,2,3,2,1,4]),Int64(2)) |
++----------------------------------------------+
+| [1, 2, 3, 2, 1, 4]                           |
++----------------------------------------------+
+```
+
+#### Aliases
+
+- list_remove
+
+### `array_remove_n`
+
+Removes the first `max` elements from the array equal to the given value.
+
+```
+array_remove_n(array, element, max)
+```
+
+#### Arguments
+
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **element**: Element to be removed from the array.
+- **max**: Number of first occurrences to remove.
+
+#### Example
+
+```
+❯ select array_remove_n([1, 2, 2, 3, 2, 1, 4], 2, 2);
++---------------------------------------------------------+
+| array_remove_n(List([1,2,2,3,2,1,4]),Int64(2),Int64(2)) |
++---------------------------------------------------------+
+| [1, 3, 2, 1, 4]                                         |
++---------------------------------------------------------+
+```
+
+#### Aliases
+
+- list_remove_n
+
+### `array_remove_all`
+
+Removes all elements from the array equal to the given value.
+
+```
+array_remove_all(array, element)
+```
+
+#### Arguments
+
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **element**: Element to be removed from the array.
+
+#### Example
+
+```
+❯ select array_remove_all([1, 2, 2, 3, 2, 1, 4], 2);
++--------------------------------------------------+
+| array_remove_all(List([1,2,2,3,2,1,4]),Int64(2)) |
++--------------------------------------------------+
+| [1, 3, 1, 4]                                     |
++--------------------------------------------------+
+```
+
+#### Aliases
+
+- list_remove_all
+
 ### `array_replace`
 
-Replaces a specified element with another specified element.
+Replaces the first occurrence of the specified element with another specified element.
 
 ```
 array_replace(array, from, to)
@@ -1605,6 +2005,105 @@ array_replace(array, from, to)
   Can be a constant, column, or function, and any combination of array operators.
 - **from**: Initial element.
 - **to**: Final element.
+
+#### Example
+
+```
+❯ select array_replace([1, 2, 2, 3, 2, 1, 4], 2, 5);
++--------------------------------------------------------+
+| array_replace(List([1,2,2,3,2,1,4]),Int64(2),Int64(5)) |
++--------------------------------------------------------+
+| [1, 5, 2, 3, 2, 1, 4]                                  |
++--------------------------------------------------------+
+```
+
+#### Aliases
+
+- list_replace
+
+### `array_replace_n`
+
+Replaces the first `max` occurrences of the specified element with another specified element.
+
+```
+array_replace_n(array, from, to, max)
+```
+
+#### Arguments
+
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **from**: Initial element.
+- **to**: Final element.
+- **max**: Number of first occurrences to replace.
+
+#### Example
+
+```
+❯ select array_replace_n([1, 2, 2, 3, 2, 1, 4], 2, 5, 2);
++-------------------------------------------------------------------+
+| array_replace_n(List([1,2,2,3,2,1,4]),Int64(2),Int64(5),Int64(2)) |
++-------------------------------------------------------------------+
+| [1, 5, 5, 3, 2, 1, 4]                                             |
++-------------------------------------------------------------------+
+```
+
+#### Aliases
+
+- list_replace_n
+
+### `array_replace_all`
+
+Replaces all occurrences of the specified element with another specified element.
+
+```
+array_replace_all(array, from, to)
+```
+
+#### Arguments
+
+- **array**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **from**: Initial element.
+- **to**: Final element.
+
+#### Example
+
+```
+❯ select array_replace_all([1, 2, 2, 3, 2, 1, 4], 2, 5);
++------------------------------------------------------------+
+| array_replace_all(List([1,2,2,3,2,1,4]),Int64(2),Int64(5)) |
++------------------------------------------------------------+
+| [1, 5, 5, 3, 5, 1, 4]                                      |
++------------------------------------------------------------+
+```
+
+#### Aliases
+
+- list_replace_all
+
+### `array_slice`
+
+Returns a slice of the array.
+
+```
+array_slice(array, begin, end)
+```
+
+#### Example
+
+```
+❯ select array_slice([1, 2, 3, 4, 5, 6, 7, 8], 3, 6);
++--------------------------------------------------------+
+| array_slice(List([1,2,3,4,5,6,7,8]),Int64(3),Int64(6)) |
++--------------------------------------------------------+
+| [3, 4, 5, 6]                                           |
++--------------------------------------------------------+
+```
+
+#### Aliases
+
+- list_slice
 
 ### `array_to_string`
 
@@ -1620,6 +2119,23 @@ array_to_string(array, delimeter)
   Can be a constant, column, or function, and any combination of array operators.
 - **delimeter**: Array element separator.
 
+#### Example
+
+```
+❯ select array_to_string([[1, 2, 3, 4], [5, 6, 7, 8]], ',');
++----------------------------------------------------+
+| array_to_string(List([1,2,3,4,5,6,7,8]),Utf8(",")) |
++----------------------------------------------------+
+| 1,2,3,4,5,6,7,8                                    |
++----------------------------------------------------+
+```
+
+#### Aliases
+
+- array_join
+- list_join
+- list_to_string
+
 ### `cardinality`
 
 Returns the total number of elements in the array.
@@ -1632,6 +2148,113 @@ cardinality(array)
 
 - **array**: Array expression.
   Can be a constant, column, or function, and any combination of array operators.
+
+#### Example
+
+```
+❯ select cardinality([[1, 2, 3, 4], [5, 6, 7, 8]]);
++--------------------------------------+
+| cardinality(List([1,2,3,4,5,6,7,8])) |
++--------------------------------------+
+| 8                                    |
++--------------------------------------+
+```
+
+### `list_append`
+
+_Alias of [array_append](#array_append)._
+
+### `list_cat`
+
+_Alias of [array_concat](#array_concat)._
+
+### `list_concat`
+
+_Alias of [array_concat](#array_concat)._
+
+### `list_dims`
+
+_Alias of [array_dims](#array_dims)._
+
+### `list_element`
+
+_Alias of [array_element](#array_element)._
+
+### `list_extract`
+
+_Alias of [array_element](#array_element)._
+
+### `list_indexof`
+
+_Alias of [array_position](#array_position)._
+
+### `list_join`
+
+_Alias of [array_to_string](#array_to_string)._
+
+### `list_length`
+
+_Alias of [array_length](#array_length)._
+
+### `list_ndims`
+
+_Alias of [array_ndims](#array_ndims)._
+
+### `list_prepend`
+
+_Alias of [array_prepend](#array_prepend)._
+
+### `list_position`
+
+_Alias of [array_position](#array_position)._
+
+### `list_positions`
+
+_Alias of [array_positions](#array_positions)._
+
+### `list_push_back`
+
+_Alias of [array_append](#array_append)._
+
+### `list_push_front`
+
+_Alias of [array_prepend](#array_prepend)._
+
+### `list_repeat`
+
+_Alias of [array_repeat](#array_repeat)._
+
+### `list_remove`
+
+_Alias of [array_remove](#array_remove)._
+
+### `list_remove_n`
+
+_Alias of [array_remove_n](#array_remove_n)._
+
+### `list_remove_all`
+
+_Alias of [array_remove_all](#array_remove_all)._
+
+### `list_replace`
+
+_Alias of [array_replace](#array_replace)._
+
+### `list_replace_n`
+
+_Alias of [array_replace_n](#array_replace_n)._
+
+### `list_replace_all`
+
+_Alias of [array_replace_all](#array_replace_all)._
+
+### `list_slice`
+
+_Alias of [array_slice](#array_slice)._
+
+### `list_to_string`
+
+_Alias of [list_to_string](#list_to_string)._
 
 ### `make_array`
 
@@ -1647,9 +2270,30 @@ make_array(expression1[, ..., expression_n])
   Can be a constant, column, or function, and any combination of arithmetic or
   string operators.
 
+#### Example
+
+```
+❯ select make_array(1, 2, 3, 4, 5);
++----------------------------------------------------------+
+| make_array(Int64(1),Int64(2),Int64(3),Int64(4),Int64(5)) |
++----------------------------------------------------------+
+| [1, 2, 3, 4, 5]                                          |
++----------------------------------------------------------+
+```
+
+#### Aliases
+
+- make_list
+
+### `make_list`
+
+_Alias of [make_array](#make_array)._
+
 ### `trim_array`
 
 Removes the last n elements from the array.
+
+DEPRECATED: use `array_slice` instead!
 
 ```
 trim_array(array, n)

@@ -21,7 +21,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion_common::{DataFusionError, Statistics};
+use datafusion_common::{Constraints, DataFusionError, Statistics};
 use datafusion_expr::{CreateExternalTable, LogicalPlan};
 pub use datafusion_expr::{TableProviderFilterPushDown, TableType};
 
@@ -40,6 +40,11 @@ pub trait TableProvider: Sync + Send {
 
     /// Get a reference to the schema for this table
     fn schema(&self) -> SchemaRef;
+
+    /// Get a reference to the constraints of the table.
+    fn constraints(&self) -> Option<&Constraints> {
+        None
+    }
 
     /// Get the type of this table for metadata/catalog purposes.
     fn table_type(&self) -> TableType;
@@ -122,8 +127,9 @@ pub trait TableProvider: Sync + Send {
         &self,
         _state: &SessionState,
         _input: Arc<dyn ExecutionPlan>,
+        _overwrite: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let msg = "Insertion not implemented for this table".to_owned();
+        let msg = "Insert into not implemented for this table".to_owned();
         Err(DataFusionError::NotImplemented(msg))
     }
 }

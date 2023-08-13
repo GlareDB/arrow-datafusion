@@ -41,6 +41,8 @@ use super::expressions::{Column, PhysicalSortExpr};
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{DisplayAs, RecordBatchStream, SendableRecordBatchStream, Statistics};
 
+use datafusion_physical_expr::equivalence::update_ordering_equivalence_with_cast;
+use datafusion_physical_expr::expressions::{CastExpr, Literal};
 use datafusion_physical_expr::{
     normalize_out_expr_with_columns_map, project_equivalence_properties,
     project_ordering_equivalence_properties, OrderingEquivalenceProperties,
@@ -95,7 +97,7 @@ impl ProjectionExec {
 
         // construct a map from the input columns to the output columns of the Projection
         let mut columns_map: HashMap<Column, Vec<Column>> = HashMap::new();
-        for (expression, name) in expr.iter() {
+        for (expr_idx, (expression, name)) in expr.iter().enumerate() {
             if let Some(column) = expression.as_any().downcast_ref::<Column>() {
                 // For some executors, logical and physical plan schema fields
                 // are not the same. The information in a `Column` comes from
@@ -105,11 +107,10 @@ impl ProjectionExec {
                 let idx = column.index();
                 let matching_input_field = input_schema.field(idx);
                 let matching_input_column = Column::new(matching_input_field.name(), idx);
-                let new_col_idx = schema.index_of(name)?;
                 let entry = columns_map
                     .entry(matching_input_column)
                     .or_insert_with(Vec::new);
-                entry.push(Column::new(name, new_col_idx));
+                entry.push(Column::new(name, expr_idx));
             };
         }
 
@@ -245,11 +246,29 @@ impl ExecutionPlan for ProjectionExec {
 
     fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
         let mut new_properties = OrderingEquivalenceProperties::new(self.schema());
+        if self.output_ordering.is_none() {
+            // If there is no output ordering, return an "empty" equivalence set:
+            return new_properties;
+        }
+
+        let mut input_oeq = self.input().ordering_equivalence_properties();
+        // Stores cast expression and its `Column` version in the output:
+        let mut cast_exprs: Vec<(CastExpr, Column)> = vec![];
+        for (idx, (expr, name)) in self.expr.iter().enumerate() {
+            if let Some(cast_expr) = expr.as_any().downcast_ref::<CastExpr>() {
+                let target_col = Column::new(name, idx);
+                cast_exprs.push((cast_expr.clone(), target_col));
+            }
+        }
+
+        update_ordering_equivalence_with_cast(&cast_exprs, &mut input_oeq);
+
         project_ordering_equivalence_properties(
-            self.input.ordering_equivalence_properties(),
+            input_oeq,
             &self.columns_map,
             &mut new_properties,
         );
+
         new_properties
     }
 
@@ -263,14 +282,14 @@ impl ExecutionPlan for ProjectionExec {
         )?))
     }
 
-    fn benefits_from_input_partitioning(&self) -> bool {
-        let all_column_expr = self
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        let all_simple_exprs = self
             .expr
             .iter()
-            .all(|(e, _)| e.as_any().downcast_ref::<Column>().is_some());
-        // If expressions are all column_expr, then all computations in this projection are reorder or rename,
+            .all(|(e, _)| e.as_any().is::<Column>() || e.as_any().is::<Literal>());
+        // If expressions are all either column_expr or Literal, then all computations in this projection are reorder or rename,
         // and projection would not benefit from the repartition, benefits_from_input_partitioning will return false.
-        !all_column_expr
+        vec![!all_simple_exprs]
     }
 
     fn execute(
@@ -408,13 +427,13 @@ mod tests {
     use super::*;
     use crate::physical_plan::common::collect;
     use crate::physical_plan::expressions::{self, col};
-    use crate::prelude::SessionContext;
     use crate::test::{self};
     use crate::test_util;
     use datafusion_common::ScalarValue;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::binary;
     use futures::future;
+    use tempfile::TempDir;
 
     // Create a binary expression without coercion. Used here when we do not want to coerce the expressions
     // to valid types. Usage can result in an execution (after plan) error.
@@ -429,12 +448,12 @@ mod tests {
 
     #[tokio::test]
     async fn project_first_column() -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let schema = test_util::aggr_test_schema();
 
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions)?;
+        let tmp_dir = TempDir::new()?;
+        let csv = test::scan_partitioned_csv(partitions, tmp_dir.path())?;
 
         // pick column c1 and name it column c1 in the output schema
         let projection =
@@ -471,12 +490,13 @@ mod tests {
         let schema = test_util::aggr_test_schema();
 
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions)?;
+        let tmp_dir = TempDir::new()?;
+        let csv = test::scan_partitioned_csv(partitions, tmp_dir.path())?;
 
         // pick column c1 and name it column c1 in the output schema
         let projection =
             ProjectionExec::try_new(vec![(col("c1", &schema)?, "c1".to_string())], csv)?;
-        assert!(!projection.benefits_from_input_partitioning());
+        assert!(!projection.benefits_from_input_partitioning()[0]);
         Ok(())
     }
 
@@ -485,7 +505,8 @@ mod tests {
         let schema = test_util::aggr_test_schema();
 
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions)?;
+        let tmp_dir = TempDir::new()?;
+        let csv = test::scan_partitioned_csv(partitions, tmp_dir.path())?;
 
         let c1 = col("c2", &schema).unwrap();
         let c2 = col("c9", &schema).unwrap();
@@ -494,16 +515,16 @@ mod tests {
         let projection =
             ProjectionExec::try_new(vec![(c1_plus_c2, "c2 + c9".to_string())], csv)?;
 
-        assert!(projection.benefits_from_input_partitioning());
+        assert!(projection.benefits_from_input_partitioning()[0]);
         Ok(())
     }
 
     #[tokio::test]
     async fn project_no_column() -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
 
-        let csv = test::scan_partitioned_csv(1)?;
+        let tmp_dir = TempDir::new()?;
+        let csv = test::scan_partitioned_csv(1, tmp_dir.path())?;
         let expected = collect(csv.execute(0, task_ctx.clone())?).await.unwrap();
 
         let projection = ProjectionExec::try_new(vec![], csv)?;
