@@ -52,7 +52,7 @@ use parking_lot::Mutex;
 
 /// Max size of each channel's buffer.
 const MAX_CHANNEL_BUFFER_SIZE: usize = 8;
-const SEND_BUFFER_SIZE: usize = 2;
+const SEND_BUFFER_SIZE: usize = 8;
 
 /// Create `n` empty channels.
 pub fn channels<T>(
