@@ -743,7 +743,7 @@ impl RepartitionExec {
             Err(e) => {
                 let e = Arc::new(e);
 
-                for (_, tx) in txs {
+                for (_, mut tx) in txs {
                     let err = Err(DataFusionError::Context(
                         "Join Error".to_string(),
                         Box::new(DataFusionError::External(Box::new(Arc::clone(&e)))),
@@ -755,7 +755,7 @@ impl RepartitionExec {
             Ok(Err(e)) => {
                 let e = Arc::new(e);
 
-                for (_, tx) in txs {
+                for (_, mut tx) in txs {
                     // wrap it because need to send error to all output partitions
                     let err = Err(DataFusionError::External(Box::new(e.clone())));
                     tx.send(Some(err)).await.ok();
@@ -764,7 +764,7 @@ impl RepartitionExec {
             // Input task completed successfully
             Ok(Ok(())) => {
                 // notify each output partition that this input partition has no more data
-                for (_, tx) in txs {
+                for (_, mut tx) in txs {
                     tx.send(None).await.ok();
                 }
             }
